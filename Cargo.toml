@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+pingora = { version = "0.6.0", features = ["cache"] }
+
+tokio = { version = "1.47.1", features = ["full"] }
