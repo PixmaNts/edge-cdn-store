@@ -4,7 +4,7 @@
 
 This proposal outlines the design and implementation of `edge-cdn-store`, a CDN cache storage backend that implements the `pingora_cache::Storage` trait. The project aims to provide a caching solution for edge computing scenarios where low latency, high throughput, and data persistence are important.
 
-The proposed architecture uses an in-memory `DashMap` for managing metadata and in-progress writes, coupled with a persistent on-disk storage layer that leverages `io_uring` for asynchronous I/O. This design relies on the operating system's kernel page cache to handle in-memory caching of frequently accessed data stored on disk, removing the need for a separate explicit in-memory data cache.
+The architecture uses an in-memory `DashMap` for managing metadata and in-progress writes, coupled with a persistent on-disk storage layer. The current MVP uses `tokio::fs` for disk I/O; `io_uring` remains a planned enhancement. The design relies on the operating system's kernel page cache to keep hot data fast without an explicit in-memory data cache.
 
 ## Motivation
 
@@ -37,22 +37,24 @@ The proposed architecture uses an in-memory `DashMap` for managing metadata and 
 
 ## Explanation
 
-### Architecture Overview
+### Architecture Overview (MVP)
 
-The `EdgeStorage` will manage metadata and in-progress writes, and interact with the disk:
+`EdgeMemoryStorage` manages metadata and in-progress writes, and interacts with the disk:
 
 ```rust
-pub struct EdgeStorage {
-    metadata_and_in_progress_cache: DashMap<String, CacheObject>, // Metadata and in-progress writes
-    on_disk_storage: IoUringDiskStorage,                           // Persistent data on disk
-    write_counter: AtomicU64,                                      // Unique write identifiers
-    // ... other fields for partial writes, eviction management, etc.
+pub struct EdgeMemoryStorage {
+    cache: Arc<DashMap<String, CacheObject>>,    // complete objects ready to serve
+    partial: Arc<DashMap<String, DashMap<u64, PartialObject>>>, // in-progress writes
+    write_counter: AtomicU64,
+    disk_root: PathBuf,
 }
 
-// CacheObject will indicate its state:
-enum CacheObject {
-    InProgress(Arc<Vec<u8>>, CacheMeta), // Data being written from origin, buffered in memory
-    OnDisk(PathBuf, CacheMeta),          // Metadata in memory, content on disk
+struct CacheObject { meta: (Vec<u8>, Vec<u8>), body: Arc<Vec<u8>> }
+struct PartialObject {
+    meta: (Vec<u8>, Vec<u8>),
+    body: Arc<RwLock<Vec<u8>>>,
+    notify: Arc<watch::Sender<usize>>, // available bytes and EOF marker
+    write_id_bytes: [u8; 8],           // for streaming write tag matching
 }
 ```
 
@@ -67,12 +69,27 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 - **Benefits**: Lock-free concurrent reads/writes for metadata and in-progress data, allowing fast access and updates.
 - **Role in Cache Misses**: When a request misses, a new `InProgress` entry is created. This entry buffers data as it arrives from the origin, allowing immediate serving of subsequent requests for the same resource while the full content is still being downloaded and written to disk.
 
-**2. On-Disk `io_uring` Storage (Persistent Cache)**
+**2. On-Disk Storage (Persistent Cache)**
 
-- **Purpose**: To provide persistent storage for all cached data, scaling beyond RAM limits.
-- **Technology**: `io_uring` for asynchronous disk I/O. This enables non-blocking operations for reading and writing cache entries, crucial for high throughput.
-- **Structure**: Cache entries are stored as files on disk. The `metadata_and_in_progress_cache` holds the file paths and metadata for these entries.
-- **Operations**: `io_uring` is used for:
+- **Purpose**: Provide persistence and scale beyond RAM.
+- **Technology (MVP)**: `tokio::fs` async I/O. `io_uring` planned as an opt-in backend.
+- **Structure**: Per-key directory layout with: `body.bin`, `meta_internal.bin`, `meta_header.bin`.
+- **Serialization**: `CacheMeta::serialize()`/`deserialize()` with correct (internal, header) ordering.
+
+### Current Status (MVP)
+
+- Storage trait implemented: `lookup`, `lookup_streaming_write`, `get_miss_handler`, `update_meta`, `purge`, and `support_streaming_partial_write`.
+- Streaming writes: concurrent in-progress per key; readers can attach via a tag returned by the miss handler.
+- Persistence: on finish, completed objects are persisted in the background; storage reloads from disk (and repopulates memory) on demand.
+- Example proxy: Pingora example wired to use the storage; adds `x-cache-status` and `x-total-time-ms` headers.
+- Tests: integration tests for miss→hit→disk reload and streaming partial read; fixed a DashMap guard removal deadlock and EOF slicing bug.
+
+### Disk Layout
+
+`<root>/<hh>/<hh>/<full_hash>/` with files:
+- `body.bin`
+- `meta_internal.bin`
+- `meta_header.bin`
   - Asynchronous reading of cache body data from disk.
   - Asynchronous writing of new cache entries to disk.
   - Deletion of purged entries.
@@ -155,8 +172,8 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 
 **Resource Overhead:**
 
-- `io_uring` requires specific kernel versions.
-- Overhead of managing `io_uring` submission and completion queues.
+- MVP uses `tokio::fs` and works on stable kernels.
+- `io_uring` (planned) requires recent kernels and careful setup.
 
 **Development Time:**
 
@@ -200,12 +217,13 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 
 **Phased Implementation:**
 
-- Implement the `DashMap` for metadata and in-progress states first, then integrate the `io_uring` disk layer.
-- Start with basic `io_uring` read/write operations and add features progressively.
+- Phase 1 (done): In-memory management + tokio::fs persistence, streaming partials, tests, Pingora example.
+- Phase 2 (next): `io_uring` disk I/O behind a feature/env flag and atomic publish (`*.part` + fsync + rename).
+- Phase 3: Eviction manager integration, metrics/observability, performance validation.
 
 ## Summary & Conclusion
 
-The proposed `EdgeStorage` architecture, using an in-memory `DashMap` for metadata and in-progress writes, and `io_uring` for persistent disk storage, provides a CDN caching solution. It balances:
+The `EdgeMemoryStorage` architecture, using in-memory `DashMap` for metadata and in-progress writes with on-disk persistence (tokio::fs in MVP, `io_uring` planned), provides a CDN caching solution. It balances:
 
 1. **Speed**: Low latency for new data (in-progress) and hot data (kernel page cache).
 2. **Persistence & Scale**: Storage for large datasets on disk.
@@ -217,16 +235,14 @@ This design addresses requirements for an edge CDN cache.
 
 **Decision Criteria for Acceptance:**
 
-- Performance benchmarks show improvements in cache hit latency and throughput.
+- Correctness validated by tests and example (hits/misses, reload on restart, streaming partial reads).
+- Performance benchmarks show improved hit latency and acceptable miss latency.
 - Memory and disk usage remain within operational limits.
-- Integration with the `pingora_cache` test suite.
-- Code review approval focusing on correctness, `io_uring` safety, and architectural soundness.
+- Code review approval focusing on correctness and architectural soundness; later, `io_uring` safety.
 
-**Next Steps Upon Approval:**
+**Next Steps:**
 
-1. Refine design for `IoUringDiskStorage` and its interaction with the `DashMap`.
-2. Develop the `IoUringDiskStorage` module and integrate it with `EdgeStorage`.
-3. Implement the logic within the `Storage` trait methods.
-4. Develop a test suite for the cache.
-5. Conduct performance benchmarking and optimization.
-6. Document implementation details and provide integration examples.
+1. Introduce `io_uring` backend behind a feature/env flag; add atomic publish with fsync + rename.
+2. Add metrics (hits/misses, disk ops, write/read timings) and optional eviction manager.
+3. Expand tests (range/seek, concurrent writers/readers, crash recovery) and run basic benchmarks.
+4. Improve example (HTTPS/H2 upstream, warm-up, knobs for storage paths and flags).

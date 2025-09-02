@@ -9,9 +9,9 @@ graph LR
     subgraph "Edge CDN Store"
         EdgeStorage["EdgeStorage"]
         DashMap["DashMap<br>(Metadata & In-Progress)"]
-        IoUringDiskStorage["IoUringDiskStorage"]
+        DiskStorage["DiskStorage (Tokio fs)"]
         EdgeStorage --> DashMap
-        EdgeStorage --> IoUringDiskStorage
+        EdgeStorage --> DiskStorage
     end
 
     Client["Client"]
@@ -25,9 +25,9 @@ graph LR
     PingoraServer --> PingoraCacheModule
     PingoraCacheModule --> EdgeStorage
     EdgeStorage --> OriginServer
-    IoUringDiskStorage <--> Disk
+    DiskStorage <--> Disk
     Disk <--> KernelPageCache
-    KernelPageCache <--> IoUringDiskStorage
+    KernelPageCache <--> DiskStorage
 ```
 
 ## 2. Sequence Diagrams
@@ -41,17 +41,17 @@ sequenceDiagram
     actor Client
     participant EdgeStorage
     participant DashMap as DashMap<br>(Metadata)
-    participant IoUringDiskStorage
+    participant DiskStorage
     participant KernelPageCache
     participant Disk
 
     Client->>EdgeStorage: Request (e.g., GET /resource)
     EdgeStorage->>DashMap: lookup(key)
     DashMap-->>EdgeStorage: CacheObject::OnDisk(metadata)
-    EdgeStorage->>IoUringDiskStorage: read(file_path)
-    IoUringDiskStorage->>KernelPageCache: read_block(offset)
-    KernelPageCache-->>IoUringDiskStorage: Data (HIT)
-    IoUringDiskStorage-->>EdgeStorage: Data
+    EdgeStorage->>DiskStorage: read(file_path)
+    DiskStorage->>KernelPageCache: read_block(offset)
+    KernelPageCache-->>DiskStorage: Data (HIT)
+    DiskStorage-->>EdgeStorage: Data
     EdgeStorage-->>Client: Serve Response
 ```
 
@@ -64,19 +64,19 @@ sequenceDiagram
     actor Client
     participant EdgeStorage
     participant DashMap as DashMap<br>(Metadata)
-    participant IoUringDiskStorage
+    participant DiskStorage
     participant KernelPageCache
     participant Disk
 
     Client->>EdgeStorage: Request (e.g., GET /resource)
     EdgeStorage->>DashMap: lookup(key)
     DashMap-->>EdgeStorage: CacheObject::OnDisk(metadata)
-    EdgeStorage->>IoUringDiskStorage: read(file_path)
-    IoUringDiskStorage->>KernelPageCache: read_block(offset)
+    EdgeStorage->>DiskStorage: read(file_path)
+    DiskStorage->>KernelPageCache: read_block(offset)
     KernelPageCache->>Disk: Fetch Data (MISS)
     Disk-->>KernelPageCache: Data
-    KernelPageCache-->>IoUringDiskStorage: Data (now in cache)
-    IoUringDiskStorage-->>EdgeStorage: Data
+    KernelPageCache-->>DiskStorage: Data (now in cache)
+    DiskStorage-->>EdgeStorage: Data
     EdgeStorage-->>Client: Serve Response
 ```
 
@@ -91,7 +91,7 @@ sequenceDiagram
     participant EdgeStorage
     participant DashMap as DashMap<br>(Metadata & In-Progress)
     participant OriginServer
-    participant IoUringDiskStorage
+    participant DiskStorage
     participant Disk
 
     Note over Client1,Disk: Initial Request (Miss)
@@ -101,7 +101,7 @@ sequenceDiagram
     EdgeStorage->>OriginServer: Fetch /new_resource
     OriginServer-->>EdgeStorage: Stream Data (Chunk 1)
     EdgeStorage->>DashMap: create_in_progress(key, Chunk 1)
-    EdgeStorage->>IoUringDiskStorage: async_write(key, Chunk 1)
+    EdgeStorage->>DiskStorage: async_write(key, Chunk 1)
 
     Note over Client2,Disk: Concurrent Request (Hit In-Progress)
     Client2->>EdgeStorage: Request (e.g., GET /new_resource)
@@ -112,13 +112,16 @@ sequenceDiagram
     Note over OriginServer,Disk: Continue Initial Request & Write
     OriginServer-->>EdgeStorage: Stream Data (Chunk N)
     EdgeStorage->>DashMap: append_in_progress(key, Chunk N)
-    EdgeStorage->>IoUringDiskStorage: async_write(key, Chunk N)
+    EdgeStorage->>DiskStorage: async_write(key, Chunk N)
 
     Note right of Disk: ... (more data streaming and writing) ...
 
     OriginServer-->>EdgeStorage: End of Stream
-    IoUringDiskStorage-->>EdgeStorage: finalize_write(key)
-    IoUringDiskStorage-->>EdgeStorage: Write Complete
+    DiskStorage-->>EdgeStorage: finalize_write(key)
+    DiskStorage-->>EdgeStorage: Write Complete
     EdgeStorage->>DashMap: update_to_on_disk(key, file_path)
     EdgeStorage-->>Client1: Serve Response (final part)
 ```
+
+Notes:
+- The current MVP uses `tokio::fs` for DiskStorage. An `io_uring` backend is planned and can replace the DiskStorage box with minimal changes to the architecture.
