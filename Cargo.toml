@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pingora = { version = "0.6.0", features = ["cache"] }
-
+pingora = { version = "0.6.0", features = ["cache", "proxy"] }
 tokio = { version = "1.47.1", features = ["full"] }
+dashmap = "6.1.0"
+async-trait = "0.1.83"
+bytes = "1.8.0"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.0", features = ["derive"] }
+io-uring = "0.7.10"
