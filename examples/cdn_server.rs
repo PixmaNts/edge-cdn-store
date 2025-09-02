@@ -1,3 +1,11 @@
+//! Minimal Pingora proxy example wired to `edge-cdn-store`.
+//!
+//! What it demonstrates:
+//! - Enabling cache for GET/HEAD and using a static storage instance.
+//! - Adding cache visibility headers: `x-cache-status` and `x-total-time-ms`.
+//! - Basic upstream timing log when a connection is established.
+//!
+//! This is a development aid to iterate on storage behavior end-to-end.
 use async_trait::async_trait;
 use edge_cdn_store::EdgeMemoryStorage;
 use once_cell::sync::Lazy;
@@ -193,11 +201,3 @@ fn main() {
     server.add_service(proxy);
     server.run_forever();
 }
-//! Minimal Pingora proxy example wired to `edge-cdn-store`.
-//!
-//! What it demonstrates:
-//! - Enabling cache for GET/HEAD and using a static storage instance.
-//! - Adding cache visibility headers: `x-cache-status` and `x-total-time-ms`.
-//! - Basic upstream timing log when a connection is established.
-//!
-//! This is a development aid to iterate on storage behavior end-to-end.

@@ -1,3 +1,13 @@
+//! Storage integration smoke tests.
+//!
+//! Goals:
+//! - Verify write → lookup (memory hit) → reload from disk across a new instance.
+//! - Ensure streaming partial reads deliver chunks as they become available.
+//!
+//! Notes:
+//! - Tracing: tests use `Span::inactive()` to satisfy the API without a tracing backend.
+//! - Lifetime: storage is `Box::leak`ed to get a `'static` reference required by the trait.
+//! - Persistence: disk writes happen in a background task; the test loops until the object appears on disk.
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -104,13 +114,3 @@ async fn streaming_partial_read() -> Result<()> {
     assert_eq!(collected, b"hello world");
     Ok(())
 }
-//! Storage integration smoke tests.
-//!
-//! Goals:
-//! - Verify write → lookup (memory hit) → reload from disk across a new instance.
-//! - Ensure streaming partial reads deliver chunks as they become available.
-//!
-//! Notes:
-//! - Tracing: tests use `Span::inactive()` to satisfy the API without a tracing backend.
-//! - Lifetime: storage is `Box::leak`ed to get a `'static` reference required by the trait.
-//! - Persistence: disk writes happen in a background task; the test loops until the object appears on disk.
