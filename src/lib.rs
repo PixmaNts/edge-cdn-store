@@ -201,8 +201,8 @@ impl EdgeMemoryStorage {
             .build()
     }
 
-    /// Lazily initialize and return an io_uring sender if enabled.
-    fn uring_tx(&'static self) -> Option<mpsc::Sender<IoUringRequest>> {
+    /// Lazily initialize and health‑probe an io_uring sender if enabled.
+    async fn try_get_uring_tx(&'static self) -> Option<mpsc::Sender<IoUringRequest>> {
         if !self.io_uring_enabled {
             return None;
         }
@@ -211,8 +211,33 @@ impl EdgeMemoryStorage {
         }
         // Initialize using the host runtime
         let tx = crate::prototype::start_io_uring_manager();
-        *self.io_uring_tx.lock().unwrap() = Some(tx.clone());
-        Some(tx)
+        // Health probe: tiny write under disk_root
+        let probe_dir = self.disk_root.clone();
+        let _ = fs::create_dir_all(&probe_dir).await;
+        let probe_path = probe_dir.join(".uring_probe");
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = IoUringRequest::Write {
+            path: probe_path.clone(),
+            offset: 0,
+            data: b"ok".to_vec(),
+            resp: resp_tx,
+        };
+        // Send and wait with a short timeout
+        if tx.send(req).await.is_err() {
+            return None;
+        }
+        let ok = match tokio::time::timeout(std::time::Duration::from_millis(500), resp_rx).await {
+            Ok(Ok(Ok(n))) if n == 2 => true,
+            _ => false,
+        };
+        // Cleanup best-effort
+        let _ = fs::remove_file(&probe_path).await;
+        if ok {
+            *self.io_uring_tx.lock().unwrap() = Some(tx.clone());
+            Some(tx)
+        } else {
+            None
+        }
     }
 
     /// Start a builder for advanced configuration
@@ -473,6 +498,8 @@ pub struct EdgeMissHandler {
     cleaned: bool,
     /// Whether to use atomic publish for disk persistence
     atomic_publish: bool,
+    /// Optional io_uring sender for disk I/O
+    io_uring_tx: Option<mpsc::Sender<IoUringRequest>>,
 }
 
 #[async_trait]
@@ -582,12 +609,18 @@ impl HandleMiss for EdgeMissHandler {
         let key_to_remove = self.key.clone();
         let cache_for_remove = Arc::clone(&self.cache);
         let use_atomic = self.atomic_publish;
+        let uring_tx = self.io_uring_tx.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let res = if use_atomic {
-                persist_to_disk_atomic(dir, &internal, &header, &body_arc).await
-            } else {
-                persist_to_disk(dir, &internal, &header, &body_arc).await
+            let res = match (use_atomic, uring_tx) {
+                (true, Some(tx)) => {
+                    persist_to_disk_atomic_uring(dir, &internal, &header, &body_arc, tx).await
+                }
+                (false, Some(tx)) => {
+                    persist_to_disk_uring(dir, &internal, &header, &body_arc, tx).await
+                }
+                (true, None) => persist_to_disk_atomic(dir, &internal, &header, &body_arc).await,
+                (false, None) => persist_to_disk(dir, &internal, &header, &body_arc).await,
             };
             if res.is_ok() {
                 HIST_DISK_WRITE_SECS.observe(start.elapsed().as_secs_f64());
@@ -683,6 +716,69 @@ async fn persist_to_disk(
     Ok(())
 }
 
+// Write helper using io_uring manager
+async fn write_all_with_uring(
+    path: &Path,
+    data: &[u8],
+    tx: &mpsc::Sender<IoUringRequest>,
+) -> Result<()> {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let req = IoUringRequest::Write {
+        path: path.to_path_buf(),
+        offset: 0,
+        data: data.to_vec(),
+        resp: resp_tx,
+    };
+    if tx.send(req).await.is_err() {
+        return Error::e_explain(
+            ErrorType::InternalError,
+            "io_uring write send failed",
+        );
+    }
+    let n = match tokio::time::timeout(std::time::Duration::from_secs(5), resp_rx).await {
+        Ok(Ok(Ok(n))) => n,
+        Ok(Ok(Err(e))) => {
+            return Error::e_explain(ErrorType::FileWriteError, format!("io_uring write error: {e}"));
+        }
+        Ok(Err(_)) => {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "io_uring write canceled",
+            );
+        }
+        Err(_) => {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "io_uring write timeout",
+            );
+        }
+    };
+    if n != data.len() {
+        return Error::e_explain(
+            ErrorType::FileWriteError,
+            format!("short write: {} vs {}", n, data.len()),
+        );
+    }
+    Ok(())
+}
+
+// Persist via io_uring writes
+async fn persist_to_disk_uring(
+    dir: PathBuf,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+    body: &Arc<Vec<u8>>,
+    tx: mpsc::Sender<IoUringRequest>,
+) -> Result<()> {
+    fs::create_dir_all(&dir)
+        .await
+        .or_err(ErrorType::FileCreateError, "create cache dir")?;
+    write_all_with_uring(&EdgeMemoryStorage::body_path(&dir), body, &tx).await?;
+    write_all_with_uring(&EdgeMemoryStorage::meta_internal_path(&dir), meta_internal, &tx).await?;
+    write_all_with_uring(&EdgeMemoryStorage::meta_header_path(&dir), meta_header, &tx).await?;
+    Ok(())
+}
+
 // Atomic publish variant: write to a temp directory and atomically rename
 async fn persist_to_disk_atomic(
     dir: PathBuf,
@@ -750,6 +846,70 @@ async fn persist_to_disk_atomic(
 
     // Rename tmp -> final atomically
     // Remove existing final dir if present (best-effort)
+    let _ = fs::remove_dir_all(&dir).await;
+    fs::rename(&tmp, &dir)
+        .await
+        .or_err(ErrorType::FileWriteError, "rename tmp->final")?;
+    Ok(())
+}
+
+// Atomic publish via io_uring writes
+async fn persist_to_disk_atomic_uring(
+    dir: PathBuf,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+    body: &Arc<Vec<u8>>,
+    tx: mpsc::Sender<IoUringRequest>,
+) -> Result<()> {
+    let tmp = dir.with_extension("tmp");
+    // Ensure parent exists
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .or_err(ErrorType::FileCreateError, "create parent dir")?;
+    }
+    // Clean tmp, then create
+    let _ = fs::remove_dir_all(&tmp).await;
+    fs::create_dir_all(&tmp)
+        .await
+        .or_err(ErrorType::FileCreateError, "create tmp cache dir")?;
+    // Write files
+    write_all_with_uring(&EdgeMemoryStorage::body_path(&tmp), body, &tx).await?;
+    write_all_with_uring(&EdgeMemoryStorage::meta_internal_path(&tmp), meta_internal, &tx).await?;
+    write_all_with_uring(&EdgeMemoryStorage::meta_header_path(&tmp), meta_header, &tx).await?;
+    // fsync files using tokio API for durability
+    let mut f = fs::File::open(EdgeMemoryStorage::body_path(&tmp))
+        .await
+        .or_err(ErrorType::FileOpenError, "open tmp body for fsync")?;
+    f.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync tmp body file")?;
+    drop(f);
+    let mut mi = fs::File::open(EdgeMemoryStorage::meta_internal_path(&tmp))
+        .await
+        .or_err(ErrorType::FileOpenError, "open tmp internal meta for fsync")?;
+    mi.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync tmp internal meta file")?;
+    drop(mi);
+    let mut mh = fs::File::open(EdgeMemoryStorage::meta_header_path(&tmp))
+        .await
+        .or_err(ErrorType::FileOpenError, "open tmp header meta for fsync")?;
+    mh.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync tmp header meta file")?;
+    drop(mh);
+    // Sync parent dir best-effort
+    if let Some(parent) = tmp.parent() {
+        let parent = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(dir_file) = std::fs::File::open(&parent) {
+                let _ = dir_file.sync_all();
+            }
+        })
+        .await;
+    }
+    // Rename tmp -> final
     let _ = fs::remove_dir_all(&dir).await;
     fs::rename(&tmp, &dir)
         .await
@@ -990,7 +1150,7 @@ impl Storage for EdgeMemoryStorage {
         let dir = self.key_dir(&hash);
         if let Some(((mi, mh), file)) = open_disk_hit_with_retry(&dir).await? {
             let meta = CacheMeta::deserialize(&mi, &mh)?;
-            let handler: HitHandler = match self.uring_tx() {
+            let handler: HitHandler = match self.try_get_uring_tx().await {
                 Some(tx) => Box::new(DiskHitHandler::Uring {
                     path: Self::body_path(&dir),
                     position: 0,
@@ -1101,6 +1261,7 @@ impl Storage for EdgeMemoryStorage {
             disk_bytes_used: &self.disk_bytes_used,
             cleaned: false,
             atomic_publish: self.atomic_publish,
+            io_uring_tx: self.try_get_uring_tx().await,
         };
         Ok(Box::new(mh))
     }

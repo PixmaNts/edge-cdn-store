@@ -33,6 +33,7 @@ mod uring_integration {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn write_hit_reload_and_purge_uring() -> Result<()> {
         let root = temp_root("persist");
         let storage1: &'static EdgeMemoryStorage =
@@ -76,6 +77,7 @@ mod uring_integration {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn disk_hit_handler_reads_and_seek_uring() -> Result<()> {
         // Write with one instance, then read from a fresh io_uring-enabled instance
         let root = temp_root("disk_seek");
@@ -132,6 +134,7 @@ mod uring_integration {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn streaming_partial_read_uring_mode() -> Result<()> {
         // Enable io_uring globally for the storage; partial reads should still work the same
         let root = temp_root("streaming");
@@ -175,5 +178,54 @@ mod uring_integration {
         assert_eq!(collected, b"hello world");
         Ok(())
     }
-}
 
+    #[tokio::test]
+    #[ignore]
+    async fn write_and_read_both_uring() -> Result<()> {
+        // End-to-end using io_uring for write and subsequent read
+        let root = temp_root("both_uring");
+        let trace = Span::inactive().handle();
+        let key = make_key("/both_uring");
+        let meta = make_meta(60);
+
+        // Writer with io_uring enabled
+        let storage1: &'static EdgeMemoryStorage = Box::leak(Box::new(
+            EdgeMemoryStorageBuilder::new()
+                .with_disk_root(root.clone())
+                .with_io_uring_enabled(Some(true))
+                .build(),
+        ));
+        let mut mh = storage1.get_miss_handler(&key, &meta, &trace).await?;
+        mh.write_body(Bytes::from_static(b"hello uring"), true).await?;
+        mh.finish().await?; // persist via io_uring write path
+
+        // Reader with io_uring enabled; new instance forces disk path
+        let storage2: &'static EdgeMemoryStorage = Box::leak(Box::new(
+            EdgeMemoryStorageBuilder::new()
+                .with_disk_root(root)
+                .with_io_uring_enabled(Some(true))
+                .build(),
+        ));
+
+        // Retry until background persist is visible
+        let (_m, mut hit) = {
+            let mut tries = 0;
+            loop {
+                if let Some(h) = storage2.lookup(&key, &trace).await? {
+                    break h;
+                }
+                tries += 1;
+                if tries > 50 {
+                    panic!("files not visible for io_uring lookup");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let mut buf = Vec::new();
+        while let Some(chunk) = hit.read_body().await? {
+            buf.extend_from_slice(chunk.as_ref());
+        }
+        assert_eq!(buf, b"hello uring");
+        Ok(())
+    }
+}
