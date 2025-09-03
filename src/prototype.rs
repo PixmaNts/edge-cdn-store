@@ -1,9 +1,9 @@
-use io_uring::{opcode, IoUring};
+use io_uring::{opcode, types, IoUring};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, IoSlice, IoSliceMut};
+use std::io::{self};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,8 +46,16 @@ pub struct IoUringManager {
 }
 
 enum PendingOperation {
-    Write(oneshot::Sender<io::Result<usize>>),
-    Read(oneshot::Sender<io::Result<Vec<u8>>>),
+    // Keep data alive until completion
+    Write {
+        resp: oneshot::Sender<io::Result<usize>>,
+        data: Vec<u8>,
+    },
+    // Keep buffer alive until completion; will be filled by kernel
+    Read {
+        resp: oneshot::Sender<io::Result<Vec<u8>>>,
+        buf: Vec<u8>,
+    },
 }
 
 impl IoUringManager {
@@ -114,15 +122,14 @@ impl IoUringManager {
                 }
                 let fd = file.unwrap().as_raw_fd();
 
-                let slice = IoSlice::new(&data);
-                let write_entry = opcode::Writev::new(
-                    io_uring::types::Fd(fd),
-                    &slice as *const IoSlice,
-                    1, // Number of iovecs
-                    offset,
-                )
-                .build()
-                .user_data(user_data);
+                // Use opcode::Write with a raw pointer; keep data alive in pending_ops
+                let len = data.len();
+                let ptr = data.as_ptr();
+                // Safety: data is kept alive in pending map until completion
+                let write_entry = opcode::Write::new(types::Fd(fd), ptr, len as _)
+                    .offset(offset as _)
+                    .build()
+                    .user_data(user_data);
 
                 unsafe {
                     if let Err(e) = self.ring.submission().push(&write_entry) {
@@ -131,7 +138,7 @@ impl IoUringManager {
                         return;
                     }
                 }
-                self.pending_ops.insert(user_data, PendingOperation::Write(resp));
+                self.pending_ops.insert(user_data, PendingOperation::Write { resp, data });
             }
             IoUringRequest::Read { path, offset, len, resp } => {
                 let user_data = get_next_user_data();
@@ -142,17 +149,15 @@ impl IoUringManager {
                 }
                 let fd = file.unwrap().as_raw_fd();
 
-                // Allocate buffer for read. This will be moved into the pending_ops.
-                let mut buffer = vec![0; len];
-                let slice = IoSliceMut::new(&mut buffer);
-                let read_entry = opcode::Readv::new(
-                    io_uring::types::Fd(fd),
-                    &slice as *const IoSliceMut,
-                    1, // Number of iovecs
-                    offset,
-                )
-                .build()
-                .user_data(user_data);
+                // Allocate buffer and set its length; keep it alive in pending map
+                let mut buf = Vec::with_capacity(len);
+                unsafe { buf.set_len(len); }
+                let ptr = buf.as_mut_ptr();
+                // Safety: buffer is valid and lives until completion
+                let read_entry = opcode::Read::new(types::Fd(fd), ptr, len as _)
+                    .offset(offset as _)
+                    .build()
+                    .user_data(user_data);
 
                 unsafe {
                     if let Err(e) = self.ring.submission().push(&read_entry) {
@@ -161,7 +166,7 @@ impl IoUringManager {
                         return;
                     }
                 }
-                self.pending_ops.insert(user_data, PendingOperation::Read(resp));
+                self.pending_ops.insert(user_data, PendingOperation::Read { resp, buf });
             }
         }
     }
@@ -182,17 +187,16 @@ impl IoUringManager {
                 };
 
                 match op {
-                    PendingOperation::Write(resp) => {
+                    PendingOperation::Write { resp, data: _ } => {
                         let _ = resp.send(res);
                     }
-                    PendingOperation::Read(resp) => {
-                        // For read, we need the actual buffer. This is tricky with io_uring
-                        // as the buffer is part of the SQE. For this prototype, we'll
-                        // assume the buffer was managed by the caller or re-allocate.
-                        // A real solution would pass the buffer in the request and get it back.
-                        // For now, we'll just send the result size.
-                        let _ = resp.send(res.map(|size| vec![0; size])); // Placeholder: send a zeroed vec of correct size
-                    }
+                    PendingOperation::Read { resp, mut buf } => match res {
+                        Ok(size) => {
+                            if size <= buf.len() { buf.truncate(size); }
+                            let _ = resp.send(Ok(buf));
+                        }
+                        Err(e) => { let _ = resp.send(Err(e)); }
+                    },
                 }
             } else {
                 eprintln!("Received completion for unknown user_data: {}", user_data);
@@ -220,17 +224,26 @@ impl IoUringManager {
 pub fn start_io_uring_manager() -> mpsc::Sender<IoUringRequest> {
     let (request_tx, request_rx) = mpsc::channel(1024); // Buffer requests
 
-    task::spawn_blocking(move || {
-        let manager = IoUringManager::new(request_rx)
-            .expect("Failed to create IoUringManager");
-        
-        // Run the manager's loop. This will block the spawned thread.
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build current_thread runtime for IoUringManager")
-            .block_on(manager.run());
-    });
+    // Prefer using the host Tokio runtime if available
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            match IoUringManager::new(request_rx) {
+                Ok(manager) => manager.run().await,
+                Err(e) => eprintln!("IoUringManager init error: {e}"),
+            }
+        });
+    } else {
+        // Fallback: dedicated thread with its own lightweight runtime
+        task::spawn_blocking(move || {
+            let manager = IoUringManager::new(request_rx)
+                .expect("Failed to create IoUringManager");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build current_thread runtime for IoUringManager")
+                .block_on(manager.run());
+        });
+    }
 
     request_tx
 }
@@ -278,10 +291,7 @@ mod tests {
         let read_result = resp_rx.await.expect("Failed to receive read response");
         assert!(read_result.is_ok(), "Read operation failed: {:?}", read_result.err());
         let read_bytes = read_result.unwrap();
-        assert_eq!(read_bytes.len(), write_data.len(), "Incorrect bytes read length");
-        // Note: Due to prototype simplification, read_bytes will be zeroed.
-        // In a real impl, the buffer would be passed in and filled.
-        // For now, we'll just check length.
+        assert_eq!(read_bytes, write_data, "Incorrect bytes content read");
         println!("Successfully read {} bytes from {:?}", read_bytes.len(), test_file_path);
 
         // Clean up

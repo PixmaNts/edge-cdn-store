@@ -7,8 +7,8 @@
 //!
 //! This is a development aid to iterate on storage behavior end-to-end.
 use async_trait::async_trait;
-use edge_cdn_store::EdgeMemoryStorage;
-use log::info;
+use edge_cdn_store::{EdgeMemoryStorage, EdgeMemoryStorageBuilder, EdgeStoreConfig};
+use log::{debug, info};
 use once_cell::sync::Lazy;
 use pingora::cache::cache_control::CacheControl;
 use pingora::cache::eviction::simple_lru::Manager as LruEvictionManager;
@@ -20,8 +20,54 @@ use pingora::protocols::Digest;
 use prometheus::{IntCounter, register_int_counter};
 use std::time::Instant;
 
-static STORAGE: Lazy<&'static EdgeMemoryStorage> =
-    Lazy::new(|| Box::leak(Box::new(EdgeMemoryStorage::new())));
+fn parse_bool_env(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn build_storage_from_opt(opt: &Opt) -> &'static EdgeMemoryStorage {
+    // Load YAML if provided to Pingora, then apply env overrides
+    let file_cfg = opt
+        .conf
+        .as_deref()
+        .map(EdgeStoreConfig::from_yaml_file)
+        .unwrap_or_default();
+
+    let mut builder = EdgeMemoryStorageBuilder::new()
+        .with_disk_root(file_cfg.resolve_disk_root())
+        .with_max_disk_bytes(file_cfg.max_disk_bytes)
+        .with_max_object_bytes(file_cfg.max_object_bytes)
+        .with_max_partial_writes(file_cfg.max_partial_writes)
+        .with_atomic_publish(file_cfg.atomic_publish)
+        .with_io_uring_enabled(file_cfg.io_uring_enabled);
+
+    // Optional env overrides
+    if let Ok(dir) = std::env::var("EDGE_STORE_DIR") {
+        builder = builder.with_disk_root(dir);
+    }
+    if let Some(b) = parse_bool_env("EDGE_ATOMIC_PUBLISH") {
+        builder = builder.with_atomic_publish(Some(b));
+    }
+    if let Some(b) = parse_bool_env("EDGE_IO_URING") {
+        builder = builder.with_io_uring_enabled(Some(b));
+    }
+    if let Some(v) = std::env::var("EDGE_MAX_DISK_BYTES").ok().and_then(|s| s.parse().ok()) {
+        builder = builder.with_max_disk_bytes(Some(v));
+    }
+    if let Some(v) = std::env::var("EDGE_MAX_OBJECT_BYTES").ok().and_then(|s| s.parse().ok()) {
+        builder = builder.with_max_object_bytes(Some(v));
+    }
+    if let Some(v) = std::env::var("EDGE_MAX_PARTIAL_WRITES").ok().and_then(|s| s.parse().ok()) {
+        builder = builder.with_max_partial_writes(Some(v));
+    }
+    debug!("storage-config {:#?}", builder);
+    Box::leak(Box::new(builder.build()))
+}
 
 // Eviction manager: simple LRU with byte limit from env EDGE_EVICTION_LIMIT_BYTES (default 512 MiB)
 static EVICTION: Lazy<&'static (dyn pingora::cache::eviction::EvictionManager + Sync)> =
@@ -44,7 +90,9 @@ const CACHE_DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(
     5,
 );
 
-pub struct CachingProxy;
+pub struct CachingProxy {
+    storage: &'static EdgeMemoryStorage,
+}
 
 #[derive(Default, Clone, Copy)]
 pub struct Ctx {
@@ -53,16 +101,12 @@ pub struct Ctx {
 }
 
 impl CachingProxy {
-    pub fn new() -> Self {
-        Self
+    pub fn new(storage: &'static EdgeMemoryStorage) -> Self {
+        Self { storage }
     }
 }
 
-impl Default for CachingProxy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No Default; storage is required to construct the proxy
 
 #[async_trait]
 impl ProxyHttp for CachingProxy {
@@ -114,7 +158,7 @@ impl ProxyHttp for CachingProxy {
         // Enable cache only for GET/HEAD
         if request_cacheable(session.req_header()) {
             session.cache.enable(
-                *STORAGE as &'static (dyn pingora::cache::Storage + Sync),
+                self.storage as &'static (dyn pingora::cache::Storage + Sync),
                 Some(*EVICTION),
                 None,
                 None,
@@ -237,10 +281,12 @@ fn main() {
     env_logger::init();
 
     let opt = Opt::parse_args();
+    debug!("{:#?}", opt);
+    let storage = build_storage_from_opt(&opt);
     let mut server = Server::new(Some(opt)).unwrap();
     server.bootstrap();
 
-    let proxy = CachingProxy::new();
+    let proxy = CachingProxy::new(storage);
 
     let mut proxy = http_proxy_service(&server.configuration, proxy);
     proxy.add_tcp("0.0.0.0:8080");

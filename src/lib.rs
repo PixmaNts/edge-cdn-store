@@ -27,6 +27,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 pub mod config;
 pub use config::{EdgeMemoryStorageBuilder, EdgeStoreConfig};
+mod prototype;
+use crate::prototype::IoUringRequest;
 use once_cell::sync::Lazy;
 use pingora::Error;
 use pingora::Result;
@@ -45,7 +47,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{mpsc, oneshot, RwLock, watch};
+use std::sync::Mutex;
 
 // Prometheus metrics
 static MET_HITS: Lazy<IntCounter> =
@@ -129,6 +132,10 @@ pub struct EdgeMemoryStorage {
     pub disk_bytes_used: AtomicUsize,
     /// Use atomic publish for on-disk persistence
     pub atomic_publish: bool,
+
+    /// io_uring configuration: enabled flag + lazy-initialized manager sender
+    io_uring_enabled: bool,
+    io_uring_tx: Mutex<Option<mpsc::Sender<IoUringRequest>>>,
 }
 
 /// A complete cached object ready for immediate serving
@@ -177,6 +184,8 @@ impl EdgeMemoryStorage {
             partial_count: AtomicUsize::new(0),
             disk_bytes_used: AtomicUsize::new(0),
             atomic_publish: false,
+            io_uring_enabled: false,
+            io_uring_tx: Mutex::new(None),
         }
     }
 
@@ -190,6 +199,20 @@ impl EdgeMemoryStorage {
             .with_atomic_publish(cfg.atomic_publish)
             .with_io_uring_enabled(cfg.io_uring_enabled)
             .build()
+    }
+
+    /// Lazily initialize and return an io_uring sender if enabled.
+    fn uring_tx(&'static self) -> Option<mpsc::Sender<IoUringRequest>> {
+        if !self.io_uring_enabled {
+            return None;
+        }
+        if let Some(tx) = self.io_uring_tx.lock().unwrap().as_ref() {
+            return Some(tx.clone());
+        }
+        // Initialize using the host runtime
+        let tx = crate::prototype::start_io_uring_manager();
+        *self.io_uring_tx.lock().unwrap() = Some(tx.clone());
+        Some(tx)
     }
 
     /// Start a builder for advanced configuration
@@ -792,45 +815,92 @@ async fn open_disk_hit_with_retry(dir: &Path) -> Result<Option<((Vec<u8>, Vec<u8
     }
 }
 
-/// Hit handler that reads directly from disk in chunks (not used in MVP hot path)
-struct DiskHitHandler {
-    file: fs::File,
-    position: u64,
-    end: Option<u64>,
+/// Hit handler that reads directly from disk in chunks
+enum DiskHitHandler {
+    /// Tokio-backed file reads
+    Tokio {
+        file: fs::File,
+        position: u64,
+        end: Option<u64>,
+    },
+    /// io_uring-backed file reads
+    Uring {
+        path: PathBuf,
+        position: u64,
+        end: Option<u64>,
+        tx: mpsc::Sender<IoUringRequest>,
+    },
 }
 
 #[async_trait]
 impl HandleHit for DiskHitHandler {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
-        // Respect range end if set and seek to current position
-        let start = std::time::Instant::now();
-        let to_read = match self.end {
-            Some(end) if end <= self.position => 0,
-            Some(end) => (end - self.position).min(64 * 1024) as usize,
-            None => 64 * 1024,
-        };
-        if to_read == 0 {
-            return Ok(None);
+        match self {
+            DiskHitHandler::Tokio { file, position, end } => {
+                // Respect range end if set and seek to current position
+                let start = std::time::Instant::now();
+                let to_read = match end {
+                    Some(e) if *e <= *position => 0,
+                    Some(e) => (*e - *position).min(64 * 1024) as usize,
+                    None => 64 * 1024,
+                };
+                if to_read == 0 {
+                    return Ok(None);
+                }
+                let mut buf = vec![0u8; to_read];
+                use tokio::io::AsyncSeekExt;
+                file
+                    .seek(std::io::SeekFrom::Start(*position))
+                    .await
+                    .or_err(ErrorType::FileReadError, "disk hit seek")?;
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .or_err(ErrorType::FileReadError, "disk hit read")?;
+                HIST_DISK_READ_SECS.observe(start.elapsed().as_secs_f64());
+                if n == 0 {
+                    return Ok(None);
+                }
+                buf.truncate(n);
+                *position += n as u64;
+                Ok(Some(Bytes::from(buf)))
+            }
+            DiskHitHandler::Uring { path, position, end, tx } => {
+                let start = std::time::Instant::now();
+                let to_read = match end {
+                    Some(e) if *e <= *position => 0,
+                    Some(e) => (*e - *position).min(64 * 1024) as usize,
+                    None => 64 * 1024,
+                };
+                if to_read == 0 {
+                    return Ok(None);
+                }
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let req = IoUringRequest::Read {
+                    path: path.clone(),
+                    offset: *position,
+                    len: to_read,
+                    resp: resp_tx,
+                };
+                if let Err(_e) = tx.send(req).await {
+                    // Fallback to tokio read if manager is unavailable
+                    return Self::tokio_read_fallback(path, position, to_read, start).await;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx).await {
+                    Ok(Ok(Ok(mut buf))) => {
+                        HIST_DISK_READ_SECS.observe(start.elapsed().as_secs_f64());
+                        let n = buf.len();
+                        if n == 0 { return Ok(None); }
+                        *position += n as u64;
+                        Ok(Some(Bytes::from(buf.split_off(0))))
+                    }
+                    _ => {
+                        // Fallback to tokio read on io_uring error/timeout
+                        Self::tokio_read_fallback(path, position, to_read, start).await
+                    }
+                }
+            }
         }
-        let mut buf = vec![0u8; to_read];
-        use tokio::io::AsyncSeekExt;
-        self
-            .file
-            .seek(std::io::SeekFrom::Start(self.position))
-            .await
-            .or_err(ErrorType::FileReadError, "disk hit seek")?;
-        let n = self
-            .file
-            .read(&mut buf)
-            .await
-            .or_err(ErrorType::FileReadError, "disk hit read")?;
-        HIST_DISK_READ_SECS.observe(start.elapsed().as_secs_f64());
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.truncate(n);
-        self.position += n as u64;
-        Ok(Some(Bytes::from(buf)))
     }
 
     async fn finish(
@@ -842,19 +912,46 @@ impl HandleHit for DiskHitHandler {
         Ok(())
     }
 
-    fn can_seek(&self) -> bool {
-        true
-    }
+    fn can_seek(&self) -> bool { true }
     fn seek(&mut self, start: usize, end: Option<usize>) -> Result<()> {
-        self.position = start as u64;
-        self.end = end.map(|e| e as u64);
+        match self {
+            DiskHitHandler::Tokio { position, end: e, .. } => {
+                *position = start as u64; *e = end.map(|x| x as u64);
+            }
+            DiskHitHandler::Uring { position, end: e, .. } => {
+                *position = start as u64; *e = end.map(|x| x as u64);
+            }
+        }
         Ok(())
     }
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
-        self
+    fn as_any(&self) -> &(dyn Any + Send + Sync) { self }
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) { self }
+}
+
+impl DiskHitHandler {
+    async fn tokio_read_fallback(
+        path: &PathBuf,
+        position: &mut u64,
+        to_read: usize,
+        start: std::time::Instant,
+    ) -> Result<Option<Bytes>> {
+        use tokio::io::AsyncSeekExt;
+        let mut file = fs::File::open(path)
+            .await
+            .or_err(ErrorType::FileOpenError, "fallback open")?;
+        file.seek(std::io::SeekFrom::Start(*position))
+            .await
+            .or_err(ErrorType::FileReadError, "fallback seek")?;
+        let mut buf = vec![0u8; to_read];
+        let n = file
+            .read(&mut buf)
+            .await
+            .or_err(ErrorType::FileReadError, "fallback read")?;
+        HIST_DISK_READ_SECS.observe(start.elapsed().as_secs_f64());
+        if n == 0 { return Ok(None); }
+        buf.truncate(n);
+        *position += n as u64;
+        Ok(Some(Bytes::from(buf)))
     }
 }
 
@@ -893,11 +990,19 @@ impl Storage for EdgeMemoryStorage {
         let dir = self.key_dir(&hash);
         if let Some(((mi, mh), file)) = open_disk_hit_with_retry(&dir).await? {
             let meta = CacheMeta::deserialize(&mi, &mh)?;
-            let handler: HitHandler = Box::new(DiskHitHandler {
-                file,
-                position: 0,
-                end: None,
-            });
+            let handler: HitHandler = match self.uring_tx() {
+                Some(tx) => Box::new(DiskHitHandler::Uring {
+                    path: Self::body_path(&dir),
+                    position: 0,
+                    end: None,
+                    tx,
+                }),
+                None => Box::new(DiskHitHandler::Tokio {
+                    file,
+                    position: 0,
+                    end: None,
+                }),
+            };
             MET_HITS.inc();
             return Ok(Some((meta, handler)));
         }

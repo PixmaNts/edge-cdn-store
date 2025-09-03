@@ -173,7 +173,7 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 **Resource Overhead:**
 
 - MVP uses `tokio::fs` and works on stable kernels.
-- `io_uring` (planned) requires recent kernels and careful setup.
+- `io_uring` read path is implemented behind a config flag; write path remains on `tokio::fs` for now.
 
 **Development Time:**
 
@@ -218,7 +218,7 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 **Phased Implementation:**
 
 - Phase 1 (done): In-memory management + tokio::fs persistence, streaming partials, tests, Pingora example.
-- Phase 2 (next): `io_uring` disk I/O behind a feature/env flag and atomic publish (`*.part` + fsync + rename).
+- Phase 2 (in progress): `io_uring` disk I/O behind a feature/env flag — read path done; next: write path and atomic publish (`*.part` + fsync + rename).
 - Phase 3: Eviction manager integration, metrics/observability, performance validation.
 
 ## Summary & Conclusion

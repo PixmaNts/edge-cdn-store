@@ -47,7 +47,7 @@ edge-cdn-cache-max-disk-bytes: 1073741824       # optional; enforced on finish (
 edge-cdn-cache-max-object-bytes: 104857600      # optional; enforced during write/finish
 edge-cdn-cache-max-partial-writes: 64           # optional; enforced on admission
 edge-cdn-cache-atomic-publish: true             # enabled (atomic publish)
-edge-cdn-cache-io-uring-enabled: false          # planned
+edge-cdn-cache-io-uring-enabled: false          # optional (uses io_uring for disk reads)
 ```
 
 Programmatic usage:
@@ -71,7 +71,7 @@ Run the demo proxy with cache + eviction + metrics:
 
 ```
 RUST_LOG=info EDGE_EVICTION_LIMIT_BYTES=268435456 \
-  cargo run --example cdn_server
+  cargo run --example cdn_server -- -c examples/pingora.yaml
 ```
 
 - Proxy: `http://localhost:8080`
@@ -109,7 +109,42 @@ Included tests:
 
 ## Roadmap
 
-- Optional `io_uring` backend for disk I/O.
+- Expand `io_uring` backend to writes and atomic publish.
+
+## Example Configuration
+
+You can configure the example via Pingora’s YAML (using our namespaced keys) and/or environment variables. The example reads the YAML passed to `pingora::Opt` (`-c path.yaml`), then applies env overrides.
+
+YAML keys (top-level):
+
+```
+edge-cdn-cache-disk-root: "/var/lib/edge_store"
+edge-cdn-cache-max-disk-bytes: 1073741824
+edge-cdn-cache-max-object-bytes: 104857600
+edge-cdn-cache-max-partial-writes: 64
+edge-cdn-cache-atomic-publish: true
+edge-cdn-cache-io-uring-enabled: true
+```
+
+Env overrides (optional):
+
+- `EDGE_STORE_DIR`: path for on-disk data
+- `EDGE_MAX_DISK_BYTES`: integer bytes
+- `EDGE_MAX_OBJECT_BYTES`: integer bytes
+- `EDGE_MAX_PARTIAL_WRITES`: integer
+- `EDGE_ATOMIC_PUBLISH`: 0/1/true/false
+- `EDGE_IO_URING`: 0/1/true/false
+
+Examples:
+
+```
+# Enable io_uring reads with atomic publish and custom dir
+EDGE_IO_URING=1 EDGE_ATOMIC_PUBLISH=1 EDGE_STORE_DIR=/tmp/edge_store \
+  cargo run --example cdn_server -- -c examples/pingora.yaml
+
+# Minimal (YAML only)
+cargo run --example cdn_server -- -c examples/pingora.yaml
+```
 - Improve capacity accounting accuracy; expand disk metrics & tracing.
 - Hot-cache layer for small objects alongside disk.
 - Startup indexer to seed eviction manager and rebuild in-memory state.

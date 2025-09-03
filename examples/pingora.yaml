@@ -1,0 +1,21 @@
+---
+# Minimal Pingora config with edge-cdn-store settings.
+# You can pass this file to the example with:
+#   cargo run --example cdn_server -- -c examples/pingora.yaml
+
+version: 1
+
+# edge-cdn-store settings (top-level, namespaced)
+edge-cdn-cache-disk-root: "/tmp/edge_store"
+
+# Capacity controls (optional)
+# edge-cdn-cache-max-disk-bytes: 1073741824   # 1 GiB
+# edge-cdn-cache-max-object-bytes: 104857600  # 100 MiB per object
+# edge-cdn-cache-max-partial-writes: 64
+
+# Write path durability (atomic publish)
+edge-cdn-cache-atomic-publish: true
+
+# Enable io_uring for disk reads (optional)
+edge-cdn-cache-io-uring-enabled: true
+
