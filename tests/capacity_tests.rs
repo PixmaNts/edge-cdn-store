@@ -165,3 +165,35 @@ async fn max_partial_writes_blocks_second_writer() {
     let res = storage.get_miss_handler(&key2, &meta, &trace).await;
     assert!(res.is_err());
 }
+
+#[tokio::test]
+async fn partial_count_not_double_decremented_after_finish() {
+    // Regression test: after finishing a writer, a new writer should be admitted
+    // when max_partial_writes == 1. Previously, double-decrement on Drop caused
+    // the internal counter to underflow and subsequent admissions to fail.
+    let cfg = EdgeStoreConfig {
+        max_partial_writes: Some(1),
+        ..Default::default()
+    };
+    let storage: &'static EdgeMemoryStorage =
+        Box::leak(Box::new(EdgeMemoryStorage::from_config(&cfg)));
+    let trace = Span::inactive().handle();
+
+    // First writer admitted and finished
+    let key1 = CacheKey::new("ns", "/pc1", "u");
+    let meta = make_meta();
+    let mut mh1 = storage
+        .get_miss_handler(&key1, &meta, &trace)
+        .await
+        .expect("first writer admitted");
+    mh1
+        .write_body(Bytes::from_static(b"ok"), true)
+        .await
+        .expect("write body");
+    mh1.finish().await.expect("finish first writer");
+
+    // Second writer should be admitted
+    let key2 = CacheKey::new("ns", "/pc2", "u");
+    let mh2 = storage.get_miss_handler(&key2, &meta, &trace).await;
+    assert!(mh2.is_ok(), "second writer should be admitted after finish");
+}

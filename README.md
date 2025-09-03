@@ -43,9 +43,9 @@ Add the following keys to your Pingora YAML (top-level):
 
 ```
 edge-cdn-cache-disk-root: "/var/lib/edge_store"
-edge-cdn-cache-max-disk-bytes: 1073741824       # optional, not enforced yet
-edge-cdn-cache-max-object-bytes: 104857600      # optional, not enforced yet
-edge-cdn-cache-max-partial-writes: 64           # optional, not enforced yet
+edge-cdn-cache-max-disk-bytes: 1073741824       # optional; enforced on finish (approximate)
+edge-cdn-cache-max-object-bytes: 104857600      # optional; enforced during write/finish
+edge-cdn-cache-max-partial-writes: 64           # optional; enforced on admission
 edge-cdn-cache-atomic-publish: true             # planned
 edge-cdn-cache-io-uring-enabled: false          # planned
 ```
@@ -109,7 +109,7 @@ Included tests:
 
 ## Roadmap
 
-- Enforce capacity limits: `max_disk_bytes`, `max_object_bytes`, `max_partial_writes`.
-- Atomic publish (write `*.part`, fsync file + dir, rename) and `io_uring` backend.
+- Atomic publish (write `*.part`, fsync file + dir, rename) and optional `io_uring` backend.
+- Improve capacity accounting accuracy and add disk read/write metrics.
 - Tiered cache adapter to add a shared/distributed layer.
 - Startup indexer to seed eviction manager and rebuild in-memory state.

@@ -421,6 +421,8 @@ pub struct EdgeMissHandler {
     max_disk_bytes: Option<usize>,
     partial_count: &'static AtomicUsize,
     disk_bytes_used: &'static AtomicUsize,
+    /// Internal: ensure cleanup (map removal + counters) happens exactly once
+    cleaned: bool,
 }
 
 #[async_trait]
@@ -534,20 +536,9 @@ impl HandleMiss for EdgeMissHandler {
             }
         });
 
-        // Remove from partial cache (avoid holding outer map guard while removing key)
-        if let Some(partial_map) = self.partial.get(&self.key) {
-            let removed = partial_map.remove(&self.write_id).is_some();
-            let empty = partial_map.is_empty();
-            drop(partial_map);
-            if empty {
-                self.partial.remove(&self.key);
-            }
-            if removed {
-                GAUGE_PARTIALS.dec();
-            }
-        }
-        // Decrease partial writer count
-        self.partial_count.fetch_sub(1, Ordering::Relaxed);
+        // Ensure cleanup (map removal + counters) only happens once
+        let mut this = self;
+        this.cleanup_once();
 
         Ok(MissFinishType::Created(body_size))
     }
@@ -560,6 +551,16 @@ impl HandleMiss for EdgeMissHandler {
 impl Drop for EdgeMissHandler {
     fn drop(&mut self) {
         // Clean up partial cache entry if handler is dropped without finishing
+        self.cleanup_once();
+    }
+}
+
+impl EdgeMissHandler {
+    fn cleanup_once(&mut self) {
+        if std::mem::take(&mut self.cleaned) {
+            // already cleaned
+            return;
+        }
         if let Some(partial_map) = self.partial.get(&self.key) {
             let removed = partial_map.remove(&self.write_id).is_some();
             let empty = partial_map.is_empty();
@@ -572,6 +573,8 @@ impl Drop for EdgeMissHandler {
             }
         }
         self.partial_count.fetch_sub(1, Ordering::Relaxed);
+        // mark as cleaned
+        self.cleaned = true;
     }
 }
 
@@ -850,6 +853,7 @@ impl Storage for EdgeMemoryStorage {
             partial_count: &self.partial_count,
             max_disk_bytes: self.max_disk_bytes,
             disk_bytes_used: &self.disk_bytes_used,
+            cleaned: false,
         };
         Ok(Box::new(mh))
     }
