@@ -17,6 +17,7 @@ use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::protocols::Digest;
 use std::time::Instant;
+use prometheus::{register_int_counter, IntCounter};
 
 static STORAGE: Lazy<&'static EdgeMemoryStorage> =
     Lazy::new(|| Box::leak(Box::new(EdgeMemoryStorage::new())));
@@ -80,6 +81,11 @@ impl ProxyHttp for CachingProxy {
         ctx.start = Some(Instant::now());
         let uri = session.req_header().uri.path();
         info!("📥 Incoming request: {uri}");
+        // Increase request metric
+        static REQ_METRIC: once_cell::sync::Lazy<IntCounter> = once_cell::sync::Lazy::new(|| {
+            register_int_counter!("edge_requests_total", "Total requests seen by example").unwrap()
+        });
+        REQ_METRIC.inc();
 
         // For demo: let's cache everything
         Ok(false) // false = continue processing (don't early return)
@@ -91,6 +97,10 @@ impl ProxyHttp for CachingProxy {
             session
                 .cache
                 .enable(*STORAGE as &'static (dyn pingora::cache::Storage + Sync), None, None, None, None);
+            // basic tracing hookup (inactive span placeholder)
+            session
+                .cache
+                .enable_tracing(pingora::cache::trace::Span::inactive());
         }
         Ok(())
     }
@@ -194,10 +204,15 @@ fn main() {
     let mut proxy = http_proxy_service(&server.configuration, proxy);
     proxy.add_tcp("0.0.0.0:8080");
 
+    // Prometheus metrics endpoint
+    let mut prometheus_service_http = pingora::services::listening::Service::prometheus_http_service();
+    prometheus_service_http.add_tcp("127.0.0.1:6192");
+
     info!("🎉 Starting EdgeCDN Server on http://localhost:8080");
     info!("📖 Try: curl http://localhost:8080/json");
     info!("📖 Try: curl http://localhost:8080/headers");
 
+    server.add_service(prometheus_service_http);
     server.add_service(proxy);
     server.run_forever();
 }

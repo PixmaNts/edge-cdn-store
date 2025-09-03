@@ -16,6 +16,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{RwLock, watch};
+use once_cell::sync::Lazy;
+use prometheus::{register_int_counter, register_int_gauge, IntCounter, IntGauge};
+
+// Prometheus metrics
+static MET_HITS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("edge_cache_hits_total", "Total cache hits").unwrap()
+});
+static MET_MISSES: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("edge_cache_misses_total", "Total cache misses").unwrap()
+});
+static MET_PURGE_EVICTIONS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("edge_cache_evictions_total", "Total evictions").unwrap()
+});
+static MET_PURGE_INVALIDATIONS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("edge_cache_invalidations_total", "Total invalidations").unwrap()
+});
+static GAUGE_KEYS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!("edge_cache_keys", "Number of complete cached objects").unwrap()
+});
+static GAUGE_PARTIALS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!("edge_cache_partial_writes", "Number of in-progress writes").unwrap()
+});
+static MET_STREAM_ATTACH_OK: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "edge_cache_stream_attach_total",
+        "Successful streaming write tag attachments"
+    )
+    .unwrap()
+});
+static MET_STREAM_ATTACH_MISS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "edge_cache_stream_attach_miss_total",
+        "Failed streaming write tag attachments"
+    )
+    .unwrap()
+});
 
 /// DashMap-based in-memory storage for pingora cache
 pub struct EdgeMemoryStorage {
@@ -350,6 +386,7 @@ impl HandleMiss for EdgeMissHandler {
 
         // Insert into complete cache
         self.cache.insert(self.key.clone(), cache_object);
+        GAUGE_KEYS.set(self.cache.len() as i64);
 
         // Persist to disk in the background (best-effort for MVP)
         let dir = self.disk_dir.clone();
@@ -363,12 +400,13 @@ impl HandleMiss for EdgeMissHandler {
 
         // Remove from partial cache (avoid holding outer map guard while removing key)
         if let Some(partial_map) = self.partial.get(&self.key) {
-            partial_map.remove(&self.write_id);
+            let removed = partial_map.remove(&self.write_id).is_some();
             let empty = partial_map.is_empty();
             drop(partial_map);
             if empty {
                 self.partial.remove(&self.key);
             }
+            if removed { GAUGE_PARTIALS.dec(); }
         }
 
         Ok(MissFinishType::Created(body_size))
@@ -383,12 +421,13 @@ impl Drop for EdgeMissHandler {
     fn drop(&mut self) {
         // Clean up partial cache entry if handler is dropped without finishing
         if let Some(partial_map) = self.partial.get(&self.key) {
-            partial_map.remove(&self.write_id);
+            let removed = partial_map.remove(&self.write_id).is_some();
             let empty = partial_map.is_empty();
             drop(partial_map);
             if empty {
                 self.partial.remove(&self.key);
             }
+            if removed { GAUGE_PARTIALS.dec(); }
         }
     }
 }
@@ -546,6 +585,7 @@ impl Storage for EdgeMemoryStorage {
             let (internal, header) = (&obj.meta.0, &obj.meta.1);
             let meta = CacheMeta::deserialize(internal, header)?;
             let handler: HitHandler = Box::new(CompleteHitHandler::new(obj.body.clone()));
+            MET_HITS.inc();
             return Ok(Some((meta, handler)));
         }
 
@@ -557,6 +597,7 @@ impl Storage for EdgeMemoryStorage {
                 let handler: HitHandler = Box::new(PartialHitHandler::new(po.body.clone(), rx));
                 let (internal, header) = (&po.meta.0, &po.meta.1);
                 let meta = CacheMeta::deserialize(internal, header)?;
+                MET_HITS.inc();
                 return Ok(Some((meta, handler)));
             }
         }
@@ -568,10 +609,13 @@ impl Storage for EdgeMemoryStorage {
             let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
             let body = obj.body.clone();
             self.cache.insert(key_s.clone(), obj);
+            GAUGE_KEYS.set(self.cache.len() as i64);
             let handler: HitHandler = Box::new(CompleteHitHandler::new(body));
+            MET_HITS.inc();
             return Ok(Some((meta, handler)));
         }
 
+        MET_MISSES.inc();
         Ok(None)
     }
 
@@ -593,10 +637,14 @@ impl Storage for EdgeMemoryStorage {
                     let handler: HitHandler = Box::new(PartialHitHandler::new(po.body.clone(), rx));
                     let (internal, header) = (&po.meta.0, &po.meta.1);
                     let meta = CacheMeta::deserialize(internal, header)?;
+                    MET_HITS.inc();
+                    MET_STREAM_ATTACH_OK.inc();
                     return Ok(Some((meta, handler)));
                 }
             }
             // Tag provided but not matched
+            MET_MISSES.inc();
+            MET_STREAM_ATTACH_MISS.inc();
             return Ok(None);
         }
         // No tag; defer to regular lookup
@@ -626,6 +674,7 @@ impl Storage for EdgeMemoryStorage {
             .entry(key_s.clone())
             .or_default()
             .insert(write_id, po);
+        GAUGE_PARTIALS.inc();
 
         let hash = Self::hash_str(&key_s);
         let dir = self.key_dir(&hash);
@@ -647,11 +696,18 @@ impl Storage for EdgeMemoryStorage {
     async fn purge(
         &'static self,
         key: &CompactCacheKey,
-        _purge_type: PurgeType,
+        purge_type: PurgeType,
         _trace: &SpanHandle,
     ) -> Result<bool> {
         let key_s = self.compact_key_to_hash(key);
         let existed = self.cache.remove(&key_s).is_some() || self.partial.remove(&key_s).is_some();
+        if existed {
+            GAUGE_KEYS.set(self.cache.len() as i64);
+        }
+        match purge_type {
+            PurgeType::Eviction => MET_PURGE_EVICTIONS.inc(),
+            PurgeType::Invalidation => MET_PURGE_INVALIDATIONS.inc(),
+        }
         // Best-effort disk cleanup
         let hash = Self::hash_str(&key_s);
         let dir = self.key_dir(&hash);
