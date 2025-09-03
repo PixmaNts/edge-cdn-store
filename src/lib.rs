@@ -1,8 +1,34 @@
+//! edge-cdn-store
+//!
+//! A CDN cache storage backend for `pingora_cache` focused on:
+//! - high concurrency via DashMap for metadata and in-progress writes
+//! - async disk persistence (Tokio), with io_uring planned
+//! - streaming partial writes with reader attachment by tag
+//! - Prometheus metrics, and compatibility with Pingora's eviction manager
+//! - simple YAML-based configuration (using Pingora's YAML with namespaced keys)
+//!
+//! Configuration keys (top-level, parsed by this crate):
+//! - `edge-cdn-cache-disk-root`: string path for on-disk data (env fallback: `EDGE_STORE_DIR`)
+//! - `edge-cdn-cache-max-disk-bytes`: optional hard cap on approximate bytes
+//! - `edge-cdn-cache-max-object-bytes`: optional hard cap per object
+//! - `edge-cdn-cache-max-partial-writes`: optional cap on concurrent in-progress writers
+//! - `edge-cdn-cache-atomic-publish`: planned
+//! - `edge-cdn-cache-io-uring-enabled`: planned
+//!
+//! Metrics exported:
+//! - counters: `edge_cache_hits_total`, `edge_cache_misses_total`,
+//!   `edge_cache_evictions_total`, `edge_cache_invalidations_total`,
+//!   `edge_cache_stream_attach_total`, `edge_cache_stream_attach_miss_total`
+//! - gauges: `edge_cache_keys`, `edge_cache_partial_writes`, `edge_cache_disk_bytes`
+//!
+//! See README.md and design/ for deeper docs and examples.
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 pub mod config;
 pub use config::{EdgeMemoryStorageBuilder, EdgeStoreConfig};
+use once_cell::sync::Lazy;
+use pingora::Error;
 use pingora::Result;
 use pingora::cache::key::{CacheHashKey, CompactCacheKey};
 use pingora::cache::storage::{
@@ -11,26 +37,22 @@ use pingora::cache::storage::{
 use pingora::cache::trace::SpanHandle;
 use pingora::cache::{CacheKey, CacheMeta};
 use pingora::{ErrorType, OrErr};
+use prometheus::{IntCounter, IntGauge, register_int_counter, register_int_gauge};
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{RwLock, watch};
-use once_cell::sync::Lazy;
-use prometheus::{register_int_counter, register_int_gauge, IntCounter, IntGauge};
 
 // Prometheus metrics
-static MET_HITS: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("edge_cache_hits_total", "Total cache hits").unwrap()
-});
-static MET_MISSES: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("edge_cache_misses_total", "Total cache misses").unwrap()
-});
-static MET_PURGE_EVICTIONS: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!("edge_cache_evictions_total", "Total evictions").unwrap()
-});
+static MET_HITS: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("edge_cache_hits_total", "Total cache hits").unwrap());
+static MET_MISSES: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("edge_cache_misses_total", "Total cache misses").unwrap());
+static MET_PURGE_EVICTIONS: Lazy<IntCounter> =
+    Lazy::new(|| register_int_counter!("edge_cache_evictions_total", "Total evictions").unwrap());
 static MET_PURGE_INVALIDATIONS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("edge_cache_invalidations_total", "Total invalidations").unwrap()
 });
@@ -39,6 +61,13 @@ static GAUGE_KEYS: Lazy<IntGauge> = Lazy::new(|| {
 });
 static GAUGE_PARTIALS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!("edge_cache_partial_writes", "Number of in-progress writes").unwrap()
+});
+static GAUGE_DISK_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "edge_cache_disk_bytes",
+        "Approximate total bytes of cached bodies on disk"
+    )
+    .unwrap()
 });
 static MET_STREAM_ATTACH_OK: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
@@ -68,6 +97,14 @@ pub struct EdgeMemoryStorage {
 
     /// Root directory for on-disk persistence
     pub disk_root: PathBuf,
+
+    // Capacity controls (optional)
+    pub max_object_bytes: Option<usize>,
+    pub max_partial_writes: Option<usize>,
+    pub max_disk_bytes: Option<usize>,
+    // Accounting
+    pub partial_count: AtomicUsize,
+    pub disk_bytes_used: AtomicUsize,
 }
 
 /// A complete cached object ready for immediate serving
@@ -92,7 +129,9 @@ struct PartialObject {
 
 impl EdgeMemoryStorage {
     /// Provide a default instance using `new()`.
-    pub fn default_instance() -> Self { Self::new() }
+    pub fn default_instance() -> Self {
+        Self::new()
+    }
     /// Create a new EdgeMemoryStorage instance
     pub fn new() -> Self {
         // Default disk root can be overridden by env var
@@ -108,24 +147,30 @@ impl EdgeMemoryStorage {
             partial: Arc::new(DashMap::new()),
             write_counter: AtomicU64::new(0),
             disk_root,
+            max_object_bytes: None,
+            max_partial_writes: None,
+            max_disk_bytes: None,
+            partial_count: AtomicUsize::new(0),
+            disk_bytes_used: AtomicUsize::new(0),
         }
     }
 
     /// Create from an EdgeStoreConfig (parsed from YAML) via the builder.
     pub fn from_config(cfg: &EdgeStoreConfig) -> Self {
-        let builder = EdgeMemoryStorageBuilder::new()
+        EdgeMemoryStorageBuilder::new()
             .with_disk_root(cfg.resolve_disk_root())
             .with_max_disk_bytes(cfg.max_disk_bytes)
             .with_max_object_bytes(cfg.max_object_bytes)
             .with_max_partial_writes(cfg.max_partial_writes)
             .with_atomic_publish(cfg.atomic_publish)
-            .with_io_uring_enabled(cfg.io_uring_enabled);
-        // Currently we only enforce disk_root; limits/hooks will be applied in future iterations
-        Self::with_disk_root(builder.disk_root)
+            .with_io_uring_enabled(cfg.io_uring_enabled)
+            .build()
     }
 
     /// Start a builder for advanced configuration
-    pub fn builder() -> EdgeMemoryStorageBuilder { EdgeMemoryStorageBuilder::new() }
+    pub fn builder() -> EdgeMemoryStorageBuilder {
+        EdgeMemoryStorageBuilder::new()
+    }
 
     /// Generate unique write ID for streaming writes
     fn next_write_id(&self) -> u64 {
@@ -173,7 +218,9 @@ impl EdgeMemoryStorage {
 }
 
 impl Default for EdgeMemoryStorage {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Handler for reading complete cached objects
@@ -369,12 +416,26 @@ pub struct EdgeMissHandler {
     meta: (Vec<u8>, Vec<u8>),
     /// Disk location info
     disk_dir: PathBuf,
+    /// Limits
+    max_object_bytes: Option<usize>,
+    max_disk_bytes: Option<usize>,
+    partial_count: &'static AtomicUsize,
+    disk_bytes_used: &'static AtomicUsize,
 }
 
 #[async_trait]
 impl HandleMiss for EdgeMissHandler {
     async fn write_body(&mut self, data: Bytes, eof: bool) -> Result<()> {
         let mut body = self.body.write().await;
+        // Enforce max_object_bytes if configured
+        if let Some(limit) = self.max_object_bytes {
+            if body.len().saturating_add(data.len()) > limit {
+                return Error::e_explain(
+                    ErrorType::Custom("ObjectTooLarge"),
+                    format!("object exceeds max_object_bytes={limit}"),
+                );
+            }
+        }
         body.extend_from_slice(&data);
         let new_len = body.len();
         drop(body); // Release lock before sending notification
@@ -397,6 +458,57 @@ impl HandleMiss for EdgeMissHandler {
         let complete_body = body.clone();
         drop(body); // Release read lock
 
+        // Enforce disk capacity if configured
+        if let Some(limit) = self.max_object_bytes {
+            // already enforced during write, but keep as safety net
+            if complete_body.len() > limit {
+                // cleanup partial entry
+                if let Some(partial_map) = self.partial.get(&self.key) {
+                    let removed = partial_map.remove(&self.write_id).is_some();
+                    let empty = partial_map.is_empty();
+                    drop(partial_map);
+                    if empty {
+                        self.partial.remove(&self.key);
+                    }
+                    if removed {
+                        GAUGE_PARTIALS.dec();
+                    }
+                }
+                self.partial_count.fetch_sub(1, Ordering::Relaxed);
+                return Error::e_explain(
+                    ErrorType::Custom("ObjectTooLarge"),
+                    format!("object exceeds max_object_bytes={limit} on finish"),
+                );
+            }
+        }
+        // Enforce disk bytes budget if configured (approximate)
+        if let Some(limit) = self.max_disk_bytes {
+            let used = self.disk_bytes_used.load(Ordering::Relaxed);
+            let needed = used.saturating_add(complete_body.len());
+            if needed > limit {
+                // cleanup partial entry
+                if let Some(partial_map) = self.partial.get(&self.key) {
+                    let removed = partial_map.remove(&self.write_id).is_some();
+                    let empty = partial_map.is_empty();
+                    drop(partial_map);
+                    if empty {
+                        self.partial.remove(&self.key);
+                    }
+                    if removed {
+                        GAUGE_PARTIALS.dec();
+                    }
+                }
+                self.partial_count.fetch_sub(1, Ordering::Relaxed);
+                return Error::e_explain(
+                    ErrorType::Custom("DiskCapacityExceeded"),
+                    format!(
+                        "disk usage {used} + {} exceeds max_disk_bytes={limit}",
+                        complete_body.len()
+                    ),
+                );
+            }
+        }
+
         let cache_object = CacheObject {
             meta: self.meta.clone(),
             body: Arc::new(complete_body),
@@ -405,6 +517,12 @@ impl HandleMiss for EdgeMissHandler {
         // Insert into complete cache
         self.cache.insert(self.key.clone(), cache_object);
         GAUGE_KEYS.set(self.cache.len() as i64);
+
+        // Approximate disk usage accounting: add body size (ignore meta)
+        if self.max_disk_bytes.is_some() {
+            let after = self.disk_bytes_used.fetch_add(body_size, Ordering::Relaxed) + body_size;
+            GAUGE_DISK_BYTES.set(after as i64);
+        }
 
         // Persist to disk in the background (best-effort for MVP)
         let dir = self.disk_dir.clone();
@@ -424,8 +542,12 @@ impl HandleMiss for EdgeMissHandler {
             if empty {
                 self.partial.remove(&self.key);
             }
-            if removed { GAUGE_PARTIALS.dec(); }
+            if removed {
+                GAUGE_PARTIALS.dec();
+            }
         }
+        // Decrease partial writer count
+        self.partial_count.fetch_sub(1, Ordering::Relaxed);
 
         Ok(MissFinishType::Created(body_size))
     }
@@ -445,8 +567,11 @@ impl Drop for EdgeMissHandler {
             if empty {
                 self.partial.remove(&self.key);
             }
-            if removed { GAUGE_PARTIALS.dec(); }
+            if removed {
+                GAUGE_PARTIALS.dec();
+            }
         }
+        self.partial_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -676,6 +801,20 @@ impl Storage for EdgeMemoryStorage {
         _trace: &SpanHandle,
     ) -> Result<MissHandler> {
         let key_s = self.key_to_hash(key);
+        // Enforce max_partial_writes if configured
+        if let Some(limit) = self.max_partial_writes {
+            let current = self.partial_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if current > limit {
+                self.partial_count.fetch_sub(1, Ordering::Relaxed);
+                return Error::e_explain(
+                    ErrorType::Custom("TooManyPartialWrites"),
+                    format!("partial writes exceed max_partial_writes={limit}"),
+                );
+            }
+        } else {
+            // track anyway
+            self.partial_count.fetch_add(1, Ordering::Relaxed);
+        }
         let write_id = self.next_write_id();
         let write_id_bytes = write_id.to_be_bytes();
         let (tx, _rx) = watch::channel::<usize>(0);
@@ -707,6 +846,10 @@ impl Storage for EdgeMemoryStorage {
             partial: Arc::clone(&self.partial),
             meta: meta.serialize()?,
             disk_dir: dir,
+            max_object_bytes: self.max_object_bytes,
+            partial_count: &self.partial_count,
+            max_disk_bytes: self.max_disk_bytes,
+            disk_bytes_used: &self.disk_bytes_used,
         };
         Ok(Box::new(mh))
     }
@@ -718,6 +861,27 @@ impl Storage for EdgeMemoryStorage {
         _trace: &SpanHandle,
     ) -> Result<bool> {
         let key_s = self.compact_key_to_hash(key);
+        // Best-effort size accounting before removal
+        if self.max_disk_bytes.is_some() {
+            // try stat on-disk body; if missing, fallback to in-memory size if present
+            let mut len_to_sub: usize = 0;
+            let cached_len = self.cache.get(&key_s).map(|c| c.body.len());
+            let hash = Self::hash_str(&key_s);
+            let dir = self.key_dir(&hash);
+            let body_path = Self::body_path(&dir);
+            if let Ok(meta) = fs::metadata(&body_path).await {
+                len_to_sub = meta.len() as usize;
+            } else if let Some(l) = cached_len {
+                len_to_sub = l;
+            }
+            if len_to_sub > 0 {
+                let after = self
+                    .disk_bytes_used
+                    .fetch_sub(len_to_sub, Ordering::Relaxed)
+                    .saturating_sub(len_to_sub);
+                GAUGE_DISK_BYTES.set(after as i64);
+            }
+        }
         let existed = self.cache.remove(&key_s).is_some() || self.partial.remove(&key_s).is_some();
         if existed {
             GAUGE_KEYS.set(self.cache.len() as i64);

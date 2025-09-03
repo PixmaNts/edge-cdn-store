@@ -8,17 +8,17 @@
 //! This is a development aid to iterate on storage behavior end-to-end.
 use async_trait::async_trait;
 use edge_cdn_store::EdgeMemoryStorage;
+use log::info;
 use once_cell::sync::Lazy;
-use pingora::cache::filters::{request_cacheable, resp_cacheable};
-use pingora::cache::{CacheMetaDefaults, RespCacheable};
 use pingora::cache::cache_control::CacheControl;
 use pingora::cache::eviction::simple_lru::Manager as LruEvictionManager;
-use log::info;
+use pingora::cache::filters::{request_cacheable, resp_cacheable};
+use pingora::cache::{CacheMetaDefaults, RespCacheable};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::protocols::Digest;
+use prometheus::{IntCounter, register_int_counter};
 use std::time::Instant;
-use prometheus::{register_int_counter, IntCounter};
 
 static STORAGE: Lazy<&'static EdgeMemoryStorage> =
     Lazy::new(|| Box::leak(Box::new(EdgeMemoryStorage::new())));
@@ -34,12 +34,15 @@ static EVICTION: Lazy<&'static (dyn pingora::cache::eviction::EvictionManager + 
         Box::leak(Box::new(mgr)) as _
     });
 
-const CACHE_DEFAULTS: CacheMetaDefaults =
-    CacheMetaDefaults::new(|status| match status.as_u16() {
+const CACHE_DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(
+    |status| match status.as_u16() {
         200 | 203 | 204 | 206 => Some(std::time::Duration::from_secs(60)),
         301 | 308 => Some(std::time::Duration::from_secs(300)),
         _ => None,
-    }, 5, 5);
+    },
+    5,
+    5,
+);
 
 pub struct CachingProxy;
 
@@ -50,7 +53,9 @@ pub struct Ctx {
 }
 
 impl CachingProxy {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for CachingProxy {
@@ -63,7 +68,9 @@ impl Default for CachingProxy {
 impl ProxyHttp for CachingProxy {
     type CTX = Ctx;
 
-    fn new_ctx(&self) -> Self::CTX { Ctx::default() }
+    fn new_ctx(&self) -> Self::CTX {
+        Ctx::default()
+    }
 
     async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         // For demo: always proxy to httpbin.org
@@ -106,15 +113,13 @@ impl ProxyHttp for CachingProxy {
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
         // Enable cache only for GET/HEAD
         if request_cacheable(session.req_header()) {
-            session
-                .cache
-                .enable(
-                    *STORAGE as &'static (dyn pingora::cache::Storage + Sync),
-                    Some(*EVICTION),
-                    None,
-                    None,
-                    None,
-                );
+            session.cache.enable(
+                *STORAGE as &'static (dyn pingora::cache::Storage + Sync),
+                Some(*EVICTION),
+                None,
+                None,
+                None,
+            );
             // basic tracing hookup (inactive span placeholder)
             session
                 .cache
@@ -130,7 +135,12 @@ impl ProxyHttp for CachingProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
         let cc = CacheControl::from_resp_headers(resp);
-        Ok(resp_cacheable(cc.as_ref(), resp.clone(), false, &CACHE_DEFAULTS))
+        Ok(resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            false,
+            &CACHE_DEFAULTS,
+        ))
     }
 
     async fn response_filter(
@@ -142,12 +152,25 @@ impl ProxyHttp for CachingProxy {
         // Inject cache status header similar to Pingora examples
         if session.cache.enabled() {
             match session.cache.phase() {
-                pingora::cache::CachePhase::Hit => upstream_response.insert_header("x-cache-status", "hit")?,
-                pingora::cache::CachePhase::Miss => upstream_response.insert_header("x-cache-status", "miss")?,
-                pingora::cache::CachePhase::Stale => upstream_response.insert_header("x-cache-status", "stale")?,
-                pingora::cache::CachePhase::StaleUpdating => upstream_response.insert_header("x-cache-status", "stale-updating")?,
-                pingora::cache::CachePhase::Expired => upstream_response.insert_header("x-cache-status", "expired")?,
-                pingora::cache::CachePhase::Revalidated | pingora::cache::CachePhase::RevalidatedNoCache(_) => upstream_response.insert_header("x-cache-status", "revalidated")?,
+                pingora::cache::CachePhase::Hit => {
+                    upstream_response.insert_header("x-cache-status", "hit")?
+                }
+                pingora::cache::CachePhase::Miss => {
+                    upstream_response.insert_header("x-cache-status", "miss")?
+                }
+                pingora::cache::CachePhase::Stale => {
+                    upstream_response.insert_header("x-cache-status", "stale")?
+                }
+                pingora::cache::CachePhase::StaleUpdating => {
+                    upstream_response.insert_header("x-cache-status", "stale-updating")?
+                }
+                pingora::cache::CachePhase::Expired => {
+                    upstream_response.insert_header("x-cache-status", "expired")?
+                }
+                pingora::cache::CachePhase::Revalidated
+                | pingora::cache::CachePhase::RevalidatedNoCache(_) => {
+                    upstream_response.insert_header("x-cache-status", "revalidated")?
+                }
                 _ => upstream_response.insert_header("x-cache-status", "invalid")?,
             }
         } else {
@@ -223,7 +246,8 @@ fn main() {
     proxy.add_tcp("0.0.0.0:8080");
 
     // Prometheus metrics endpoint
-    let mut prometheus_service_http = pingora::services::listening::Service::prometheus_http_service();
+    let mut prometheus_service_http =
+        pingora::services::listening::Service::prometheus_http_service();
     prometheus_service_http.add_tcp("127.0.0.1:6192");
 
     info!("🎉 Starting EdgeCDN Server on http://localhost:8080");

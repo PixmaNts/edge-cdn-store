@@ -17,10 +17,14 @@ mod basics {
         let handles: Vec<_> = (0..10)
             .map(|_| {
                 let s = Arc::clone(&storage);
-                tokio::spawn(async move { let _ = &s.write_counter; })
+                tokio::spawn(async move {
+                    let _ = &s.write_counter;
+                })
             })
             .collect();
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
     }
 
     #[test]
@@ -53,11 +57,13 @@ mod persistence_and_streaming {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("edge_store_integ_{}_{}", label, ts));
+        p.push(format!("edge_store_integ_{label}_{ts}"));
         p
     }
 
-    fn make_key() -> CacheKey { CacheKey::new("ns", "/resource", "u1") }
+    fn make_key() -> CacheKey {
+        CacheKey::new("ns", "/resource", "u1")
+    }
 
     fn make_meta(max_age_secs: u64) -> CacheMeta {
         let created = SystemTime::now();
@@ -88,16 +94,22 @@ mod persistence_and_streaming {
             Box::leak(Box::new(EdgeMemoryStorage::with_disk_root(root)));
         let mut tries = 0;
         let hit = loop {
-            if let Some(h) = storage2.lookup(&key, &trace).await? { break Some(h); }
+            if let Some(h) = storage2.lookup(&key, &trace).await? {
+                break Some(h);
+            }
             tries += 1;
-            if tries > 50 { break None; }
+            if tries > 50 {
+                break None;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert!(hit.is_some());
 
         // purge
         let ckey = key.to_compact();
-        let _ = storage2.purge(&ckey, PurgeType::Invalidation, &trace).await?;
+        let _ = storage2
+            .purge(&ckey, PurgeType::Invalidation, &trace)
+            .await?;
         assert!(storage2.lookup(&key, &trace).await?.is_none());
         Ok(())
     }
@@ -123,8 +135,12 @@ mod persistence_and_streaming {
                 .await?
                 .expect("partial hit");
             let mut read = Vec::new();
-            if let Some(chunk) = hit.read_body().await? { read.extend_from_slice(chunk.as_ref()); }
-            while let Some(chunk) = hit.read_body().await? { read.extend_from_slice(chunk.as_ref()); }
+            if let Some(chunk) = hit.read_body().await? {
+                read.extend_from_slice(chunk.as_ref());
+            }
+            while let Some(chunk) = hit.read_body().await? {
+                read.extend_from_slice(chunk.as_ref());
+            }
             Result::Ok(read)
         });
 
@@ -172,7 +188,8 @@ mod persistence_and_streaming {
         let key = CacheKey::new("ns", "/update", "u1");
         let meta = make_meta(60);
         let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
-        mh.write_body(Bytes::from_static(b"hello world"), true).await?;
+        mh.write_body(Bytes::from_static(b"hello world"), true)
+            .await?;
         mh.finish().await?;
 
         let mut new_header = ResponseHeader::build(200, None).unwrap();
@@ -196,8 +213,9 @@ mod persistence_and_streaming {
                 if let Ok(rd) = stdfs::read_dir(&path) {
                     for entry in rd.flatten() {
                         let p = entry.path();
-                        if p.is_dir() { stack.push(p); }
-                        else if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                        if p.is_dir() {
+                            stack.push(p);
+                        } else if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
                             match name {
                                 "meta_internal.bin" => found_internal = true,
                                 "meta_header.bin" => found_header = true,
@@ -208,9 +226,13 @@ mod persistence_and_streaming {
                     }
                 }
             }
-            if found_internal && found_header && found_body { break; }
+            if found_internal && found_header && found_body {
+                break;
+            }
             tries += 1;
-            if tries > 50 { panic!("meta files not visible on disk"); }
+            if tries > 50 {
+                panic!("meta files not visible on disk");
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Ok(())
@@ -226,14 +248,17 @@ mod persistence_and_streaming {
         let meta = make_meta(60);
 
         let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
-        mh.write_body(Bytes::from_static(b"hello world"), true).await?;
+        mh.write_body(Bytes::from_static(b"hello world"), true)
+            .await?;
         mh.finish().await?;
 
         let (_meta2, mut hit) = storage.lookup(&key, &trace).await?.expect("hit");
         assert!(hit.can_seek());
         hit.seek(6, None)?;
         let mut buf = Vec::new();
-        while let Some(chunk) = hit.read_body().await? { buf.extend_from_slice(chunk.as_ref()); }
+        while let Some(chunk) = hit.read_body().await? {
+            buf.extend_from_slice(chunk.as_ref());
+        }
         assert_eq!(buf, b"world");
         Ok(())
     }

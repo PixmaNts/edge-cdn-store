@@ -1,6 +1,6 @@
+use crate::EdgeMemoryStorage;
 use serde::Deserialize;
 use std::path::PathBuf;
-use crate::EdgeMemoryStorage;
 
 /// Configuration for EdgeMemoryStorage parsed from a Pingora YAML file.
 ///
@@ -72,23 +72,47 @@ pub struct EdgeMemoryStorageBuilder {
 
 impl EdgeMemoryStorageBuilder {
     pub fn new() -> Self {
-        Self { disk_root: PathBuf::from("edge_store_data"), ..Default::default() }
+        Self {
+            disk_root: PathBuf::from("edge_store_data"),
+            ..Default::default()
+        }
     }
     pub fn with_disk_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.disk_root = root.into();
         self
     }
-    pub fn with_max_disk_bytes(mut self, v: Option<usize>) -> Self { self.max_disk_bytes = v; self }
-    pub fn with_max_object_bytes(mut self, v: Option<usize>) -> Self { self.max_object_bytes = v; self }
-    pub fn with_max_partial_writes(mut self, v: Option<usize>) -> Self { self.max_partial_writes = v; self }
-    pub fn with_atomic_publish(mut self, v: Option<bool>) -> Self { self.atomic_publish = v; self }
-    pub fn with_io_uring_enabled(mut self, v: Option<bool>) -> Self { self.io_uring_enabled = v; self }
+    pub fn with_max_disk_bytes(mut self, v: Option<usize>) -> Self {
+        self.max_disk_bytes = v;
+        self
+    }
+    pub fn with_max_object_bytes(mut self, v: Option<usize>) -> Self {
+        self.max_object_bytes = v;
+        self
+    }
+    pub fn with_max_partial_writes(mut self, v: Option<usize>) -> Self {
+        self.max_partial_writes = v;
+        self
+    }
+    pub fn with_atomic_publish(mut self, v: Option<bool>) -> Self {
+        self.atomic_publish = v;
+        self
+    }
+    pub fn with_io_uring_enabled(mut self, v: Option<bool>) -> Self {
+        self.io_uring_enabled = v;
+        self
+    }
 
     /// Build an `EdgeMemoryStorage` instance from this builder.
     ///
     /// Currently only `disk_root` is enforced. Other options are accepted and will
     /// be applied as features are implemented (max sizes, atomic publish, io_uring, etc.).
     pub fn build(self) -> EdgeMemoryStorage {
-        EdgeMemoryStorage::with_disk_root(self.disk_root)
+        let mut s = EdgeMemoryStorage::with_disk_root(self.disk_root);
+        // Apply capacity limits that the storage currently understands.
+        s.max_object_bytes = self.max_object_bytes;
+        s.max_partial_writes = self.max_partial_writes;
+        s.max_disk_bytes = self.max_disk_bytes;
+        // Future: atomic_publish / io_uring_enabled toggles will be applied when implemented.
+        s
     }
 }

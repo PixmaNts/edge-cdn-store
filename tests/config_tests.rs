@@ -2,7 +2,9 @@ use edge_cdn_store::{EdgeMemoryStorage, EdgeMemoryStorageBuilder, EdgeStoreConfi
 use std::path::PathBuf;
 
 fn res(p: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources").join(p)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/resources")
+        .join(p)
 }
 
 #[test]
