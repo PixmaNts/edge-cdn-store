@@ -511,28 +511,31 @@ impl HandleMiss for EdgeMissHandler {
             }
         }
 
-        let cache_object = CacheObject {
-            meta: self.meta.clone(),
-            body: Arc::new(complete_body),
-        };
-
-        // Insert into complete cache
-        self.cache.insert(self.key.clone(), cache_object);
-        GAUGE_KEYS.set(self.cache.len() as i64);
-
         // Approximate disk usage accounting: add body size (ignore meta)
         if self.max_disk_bytes.is_some() {
             let after = self.disk_bytes_used.fetch_add(body_size, Ordering::Relaxed) + body_size;
             GAUGE_DISK_BYTES.set(after as i64);
         }
 
-        // Persist to disk in the background (best-effort for MVP)
+        // Insert into complete in-memory cache immediately for fast hits
+        let body_arc = Arc::new(complete_body);
+        let cache_object = CacheObject {
+            meta: self.meta.clone(),
+            body: body_arc.clone(),
+        };
+        self.cache.insert(self.key.clone(), cache_object);
+        GAUGE_KEYS.set(self.cache.len() as i64);
+
+        // Persist to disk in background; after success, drop in-memory body to rely on disk
         let dir = self.disk_dir.clone();
         let (internal, header) = self.meta.clone();
-        let body_for_disk = self.cache.get(&self.key).map(|c| c.body.clone());
+        let key_to_remove = self.key.clone();
+        let cache_for_remove = Arc::clone(&self.cache);
         tokio::spawn(async move {
-            if let Some(body_arc) = body_for_disk {
-                let _ = persist_to_disk(dir, &internal, &header, &body_arc).await;
+            if persist_to_disk(dir, &internal, &header, &body_arc).await.is_ok() {
+                if cache_for_remove.remove(&key_to_remove).is_some() {
+                    GAUGE_KEYS.dec();
+                }
             }
         });
 
@@ -621,8 +624,8 @@ async fn persist_to_disk(
     Ok(())
 }
 
-// Read meta and body from disk and construct CacheObject
-async fn load_from_disk(dir: &Path) -> Result<Option<CacheObject>> {
+// Check disk paths exist and load meta; open body file for disk-backed handler
+async fn open_disk_hit(dir: &Path) -> Result<Option<((Vec<u8>, Vec<u8>), fs::File)>> {
     let body_path = EdgeMemoryStorage::body_path(dir);
     let meta_header_path = EdgeMemoryStorage::meta_header_path(dir);
     let meta_internal_path = EdgeMemoryStorage::meta_internal_path(dir);
@@ -636,14 +639,6 @@ async fn load_from_disk(dir: &Path) -> Result<Option<CacheObject>> {
             .await
             .or_err(ErrorType::InternalError, "check internal meta exists")?
     {
-        let mut bf = fs::File::open(body_path)
-            .await
-            .or_err(ErrorType::FileOpenError, "open body file")?;
-        let mut body = Vec::new();
-        bf.read_to_end(&mut body)
-            .await
-            .or_err(ErrorType::FileReadError, "read body file")?;
-
         let mut mif = fs::File::open(meta_internal_path)
             .await
             .or_err(ErrorType::FileOpenError, "open internal meta file")?;
@@ -660,10 +655,11 @@ async fn load_from_disk(dir: &Path) -> Result<Option<CacheObject>> {
             .await
             .or_err(ErrorType::FileReadError, "read header meta file")?;
 
-        Ok(Some(CacheObject {
-            meta: (mi, mh),
-            body: Arc::new(body),
-        }))
+        let body_file = fs::File::open(body_path)
+            .await
+            .or_err(ErrorType::FileOpenError, "open body file")?;
+
+        Ok(Some(((mi, mh), body_file)))
     } else {
         Ok(None)
     }
@@ -679,7 +675,22 @@ struct DiskHitHandler {
 #[async_trait]
 impl HandleHit for DiskHitHandler {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
-        let mut buf = vec![0u8; 64 * 1024];
+        // Respect range end if set and seek to current position
+        let to_read = match self.end {
+            Some(end) if end <= self.position => 0,
+            Some(end) => (end - self.position).min(64 * 1024) as usize,
+            None => 64 * 1024,
+        };
+        if to_read == 0 {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; to_read];
+        use tokio::io::AsyncSeekExt;
+        self
+            .file
+            .seek(std::io::SeekFrom::Start(self.position))
+            .await
+            .or_err(ErrorType::FileReadError, "disk hit seek")?;
         let n = self
             .file
             .read(&mut buf)
@@ -748,15 +759,16 @@ impl Storage for EdgeMemoryStorage {
             }
         }
 
-        // Load from disk if exists
+        // Disk-backed hit without loading whole body into memory
         let hash = Self::hash_str(&key_s);
         let dir = self.key_dir(&hash);
-        if let Some(obj) = load_from_disk(&dir).await? {
-            let meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
-            let body = obj.body.clone();
-            self.cache.insert(key_s.clone(), obj);
-            GAUGE_KEYS.set(self.cache.len() as i64);
-            let handler: HitHandler = Box::new(CompleteHitHandler::new(body));
+        if let Some(((mi, mh), file)) = open_disk_hit(&dir).await? {
+            let meta = CacheMeta::deserialize(&mi, &mh)?;
+            let handler: HitHandler = Box::new(DiskHitHandler {
+                file,
+                position: 0,
+                end: None,
+            });
             MET_HITS.inc();
             return Ok(Some((meta, handler)));
         }
@@ -939,5 +951,94 @@ impl Storage for EdgeMemoryStorage {
 
     fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use pingora::cache::storage::Storage;
+    use pingora::cache::trace::Span;
+    use pingora::cache::{CacheKey, CacheMeta};
+    use pingora::http::ResponseHeader;
+    use std::time::{Duration, SystemTime};
+
+    fn make_meta(max_age_secs: u64) -> CacheMeta {
+        let created = SystemTime::now();
+        let fresh_until = created + Duration::from_secs(max_age_secs);
+        let header = ResponseHeader::build(200, None).unwrap();
+        CacheMeta::new(fresh_until, created, 0, 0, header)
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("edge_store_unit_{label}_{ts}"));
+        p
+    }
+
+    #[tokio::test]
+    async fn demotes_in_memory_after_background_persist() -> Result<()> {
+        let root = temp_root("demote");
+        let storage: &'static EdgeMemoryStorage =
+            Box::leak(Box::new(EdgeMemoryStorage::with_disk_root(root.clone())));
+        let trace = Span::inactive().handle();
+
+        let key = CacheKey::new("ns", "/demote", "u1");
+        let meta = make_meta(60);
+
+        // Write and finish
+        let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
+        mh.write_body(Bytes::from_static(b"hello world"), true).await?;
+        mh.finish().await?;
+
+        // Immediate lookup should hit (served from memory)
+        assert!(storage.lookup(&key, &trace).await?.is_some());
+
+        // In-memory entry should be present right after finish
+        let key_s = storage.key_to_hash(&key);
+        assert!(storage.cache.contains_key(&key_s));
+
+        // Wait until files are visible on disk
+        let mut tries = 0;
+        loop {
+            let hash = EdgeMemoryStorage::hash_str(&storage.key_to_hash(&key));
+            let dir = storage.key_dir(&hash);
+            if fs::try_exists(EdgeMemoryStorage::body_path(&dir)).await.unwrap_or(false)
+                && fs::try_exists(EdgeMemoryStorage::meta_header_path(&dir))
+                    .await
+                    .unwrap_or(false)
+                && fs::try_exists(EdgeMemoryStorage::meta_internal_path(&dir))
+                    .await
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            tries += 1;
+            if tries > 100 {
+                panic!("persist did not materialize files");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Verify in-memory entry is removed after persist completes
+        let mut tries = 0;
+        loop {
+            // Lookup should still be a hit throughout
+            assert!(storage.lookup(&key, &trace).await?.is_some());
+            if !storage.cache.contains_key(&key_s) {
+                break; // demoted
+            }
+            tries += 1;
+            if tries > 200 {
+                panic!("in-memory entry not demoted after persist");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 }

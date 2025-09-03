@@ -262,4 +262,56 @@ mod persistence_and_streaming {
         assert_eq!(buf, b"world");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn disk_hit_handler_reads_and_seek() -> Result<()> {
+        // Write with one instance, then read from a fresh instance (forces disk path)
+        let root = temp_root("disk_seek");
+        let storage1: &'static EdgeMemoryStorage =
+            Box::leak(Box::new(EdgeMemoryStorage::with_disk_root(root.clone())));
+        let trace = Span::inactive().handle();
+        let key = CacheKey::new("ns", "/disk_seek", "u1");
+        let meta = make_meta(60);
+
+        let mut mh = storage1.get_miss_handler(&key, &meta, &trace).await?;
+        mh.write_body(Bytes::from_static(b"hello world"), true).await?;
+        mh.finish().await?;
+
+        // New storage instance uses disk-backed handler
+        let storage2: &'static EdgeMemoryStorage =
+            Box::leak(Box::new(EdgeMemoryStorage::with_disk_root(root)));
+
+        // Retry until background persist has completed
+        let (_meta2, mut hit) = {
+            let mut tries = 0;
+            loop {
+                if let Some(h) = storage2.lookup(&key, &trace).await? {
+                    break h;
+                }
+                tries += 1;
+                if tries > 50 {
+                    panic!("disk files not visible for lookup");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        // Read full body
+        let mut buf = Vec::new();
+        while let Some(chunk) = hit.read_body().await? {
+            buf.extend_from_slice(chunk.as_ref());
+        }
+        assert_eq!(buf, b"hello world");
+
+        // Get a new handler and verify seek works on disk handler too
+        let (_m, mut hit2) = storage2.lookup(&key, &trace).await?.expect("hit again");
+        assert!(hit2.can_seek());
+        hit2.seek(6, None)?;
+        let mut buf2 = Vec::new();
+        while let Some(chunk) = hit2.read_body().await? {
+            buf2.extend_from_slice(chunk.as_ref());
+        }
+        assert_eq!(buf2, b"world");
+        Ok(())
+    }
 }
