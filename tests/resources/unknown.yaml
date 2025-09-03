@@ -1,0 +1,5 @@
+---
+version: 1
+edge-cdn-cache-disk-root: "/tmp/edge_store_unknown"
+edge-cdn-cache-unknown-key: 42
+totally-unrelated: true

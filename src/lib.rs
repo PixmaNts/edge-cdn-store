@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
+pub mod config;
+pub use config::{EdgeMemoryStorageBuilder, EdgeStoreConfig};
 use pingora::Result;
 use pingora::cache::key::{CacheHashKey, CompactCacheKey};
 use pingora::cache::storage::{
@@ -108,6 +110,22 @@ impl EdgeMemoryStorage {
             disk_root,
         }
     }
+
+    /// Create from an EdgeStoreConfig (parsed from YAML) via the builder.
+    pub fn from_config(cfg: &EdgeStoreConfig) -> Self {
+        let builder = EdgeMemoryStorageBuilder::new()
+            .with_disk_root(cfg.resolve_disk_root())
+            .with_max_disk_bytes(cfg.max_disk_bytes)
+            .with_max_object_bytes(cfg.max_object_bytes)
+            .with_max_partial_writes(cfg.max_partial_writes)
+            .with_atomic_publish(cfg.atomic_publish)
+            .with_io_uring_enabled(cfg.io_uring_enabled);
+        // Currently we only enforce disk_root; limits/hooks will be applied in future iterations
+        Self::with_disk_root(builder.disk_root)
+    }
+
+    /// Start a builder for advanced configuration
+    pub fn builder() -> EdgeMemoryStorageBuilder { EdgeMemoryStorageBuilder::new() }
 
     /// Generate unique write ID for streaming writes
     fn next_write_id(&self) -> u64 {

@@ -12,6 +12,7 @@ use once_cell::sync::Lazy;
 use pingora::cache::filters::{request_cacheable, resp_cacheable};
 use pingora::cache::{CacheMetaDefaults, RespCacheable};
 use pingora::cache::cache_control::CacheControl;
+use pingora::cache::eviction::simple_lru::Manager as LruEvictionManager;
 use log::info;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
@@ -21,6 +22,17 @@ use prometheus::{register_int_counter, IntCounter};
 
 static STORAGE: Lazy<&'static EdgeMemoryStorage> =
     Lazy::new(|| Box::leak(Box::new(EdgeMemoryStorage::new())));
+
+// Eviction manager: simple LRU with byte limit from env EDGE_EVICTION_LIMIT_BYTES (default 512 MiB)
+static EVICTION: Lazy<&'static (dyn pingora::cache::eviction::EvictionManager + Sync)> =
+    Lazy::new(|| {
+        let limit = std::env::var("EDGE_EVICTION_LIMIT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(512 * 1024 * 1024);
+        let mgr = LruEvictionManager::new(limit);
+        Box::leak(Box::new(mgr)) as _
+    });
 
 const CACHE_DEFAULTS: CacheMetaDefaults =
     CacheMetaDefaults::new(|status| match status.as_u16() {
@@ -96,7 +108,13 @@ impl ProxyHttp for CachingProxy {
         if request_cacheable(session.req_header()) {
             session
                 .cache
-                .enable(*STORAGE as &'static (dyn pingora::cache::Storage + Sync), None, None, None, None);
+                .enable(
+                    *STORAGE as &'static (dyn pingora::cache::Storage + Sync),
+                    Some(*EVICTION),
+                    None,
+                    None,
+                    None,
+                );
             // basic tracing hookup (inactive span placeholder)
             session
                 .cache

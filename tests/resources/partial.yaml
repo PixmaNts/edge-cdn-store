@@ -1,0 +1,3 @@
+---
+version: 1
+edge-cdn-cache-disk-root: "/tmp/edge_store_partial"

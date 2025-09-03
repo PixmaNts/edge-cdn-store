@@ -1,0 +1,94 @@
+use serde::Deserialize;
+use std::path::PathBuf;
+use crate::EdgeMemoryStorage;
+
+/// Configuration for EdgeMemoryStorage parsed from a Pingora YAML file.
+///
+/// Keys are top-level and prefixed with `edge-cdn-cache-...` to avoid collisions.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct EdgeStoreConfig {
+    /// Root directory for on-disk data
+    #[serde(rename = "edge-cdn-cache-disk-root")]
+    pub disk_root: Option<String>,
+
+    /// Maximum total disk usage in bytes (optional, not enforced yet)
+    #[serde(rename = "edge-cdn-cache-max-disk-bytes")]
+    pub max_disk_bytes: Option<usize>,
+
+    /// Maximum single object size admitted in bytes (optional, not enforced yet)
+    #[serde(rename = "edge-cdn-cache-max-object-bytes")]
+    pub max_object_bytes: Option<usize>,
+
+    /// Maximum number of concurrent partial writes (optional, not enforced yet)
+    #[serde(rename = "edge-cdn-cache-max-partial-writes")]
+    pub max_partial_writes: Option<usize>,
+
+    /// Enable atomic publish (write .part + fsync + rename) (planned)
+    #[serde(rename = "edge-cdn-cache-atomic-publish")]
+    pub atomic_publish: Option<bool>,
+
+    /// Enable io_uring backend when available (planned)
+    #[serde(rename = "edge-cdn-cache-io-uring-enabled")]
+    pub io_uring_enabled: Option<bool>,
+}
+
+impl EdgeStoreConfig {
+    /// Parse configuration from a YAML string. Unknown keys are ignored.
+    pub fn from_yaml_str(yaml: &str) -> Self {
+        serde_yaml::from_str::<EdgeStoreConfig>(yaml).unwrap_or_default()
+    }
+
+    /// Read a YAML file from disk and parse the configuration.
+    pub fn from_yaml_file(path: impl AsRef<std::path::Path>) -> Self {
+        std::fs::read_to_string(&path)
+            .ok()
+            .as_deref()
+            .map(Self::from_yaml_str)
+            .unwrap_or_default()
+    }
+
+    /// Resolve disk root with environment fallback.
+    pub fn resolve_disk_root(&self) -> PathBuf {
+        if let Some(root) = &self.disk_root {
+            return PathBuf::from(root);
+        }
+        if let Ok(env_root) = std::env::var("EDGE_STORE_DIR") {
+            return PathBuf::from(env_root);
+        }
+        PathBuf::from("edge_store_data")
+    }
+}
+
+/// Builder pattern for EdgeMemoryStorage configuration.
+#[derive(Debug, Default, Clone)]
+pub struct EdgeMemoryStorageBuilder {
+    pub disk_root: PathBuf,
+    pub max_disk_bytes: Option<usize>,
+    pub max_object_bytes: Option<usize>,
+    pub max_partial_writes: Option<usize>,
+    pub atomic_publish: Option<bool>,
+    pub io_uring_enabled: Option<bool>,
+}
+
+impl EdgeMemoryStorageBuilder {
+    pub fn new() -> Self {
+        Self { disk_root: PathBuf::from("edge_store_data"), ..Default::default() }
+    }
+    pub fn with_disk_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.disk_root = root.into();
+        self
+    }
+    pub fn with_max_disk_bytes(mut self, v: Option<usize>) -> Self { self.max_disk_bytes = v; self }
+    pub fn with_max_object_bytes(mut self, v: Option<usize>) -> Self { self.max_object_bytes = v; self }
+    pub fn with_max_partial_writes(mut self, v: Option<usize>) -> Self { self.max_partial_writes = v; self }
+    pub fn with_atomic_publish(mut self, v: Option<bool>) -> Self { self.atomic_publish = v; self }
+    pub fn with_io_uring_enabled(mut self, v: Option<bool>) -> Self { self.io_uring_enabled = v; self }
+
+    /// Build an `EdgeMemoryStorage` instance from this builder.
+    ///
+    /// Currently only `disk_root` is enforced. Other options are accepted and will
+    /// be applied as features are implemented (max sizes, atomic publish, io_uring, etc.).
+    pub fn build(self) -> EdgeMemoryStorage {
+        EdgeMemoryStorage::with_disk_root(self.disk_root)
+    }
+}

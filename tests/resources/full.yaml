@@ -1,0 +1,9 @@
+---
+version: 1
+edge-cdn-cache-disk-root: "/tmp/edge_store_full"
+edge-cdn-cache-max-disk-bytes: 1073741824
+edge-cdn-cache-max-object-bytes: 104857600
+edge-cdn-cache-max-partial-writes: 64
+edge-cdn-cache-atomic-publish: true
+edge-cdn-cache-io-uring-enabled: false
+some-unrelated-key: "kept by app and ignored by pingora"
