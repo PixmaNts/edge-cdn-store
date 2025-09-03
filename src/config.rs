@@ -30,6 +30,10 @@ pub struct EdgeStoreConfig {
     /// Enable io_uring backend when available (planned)
     #[serde(rename = "edge-cdn-cache-io-uring-enabled")]
     pub io_uring_enabled: Option<bool>,
+
+    /// Max bytes to retain in memory for in-progress writes per object (to prevent OOM)
+    #[serde(rename = "edge-cdn-cache-max-in-mem-partial-bytes")]
+    pub max_in_mem_partial_bytes: Option<usize>,
 }
 
 impl EdgeStoreConfig {
@@ -68,6 +72,7 @@ pub struct EdgeMemoryStorageBuilder {
     pub max_partial_writes: Option<usize>,
     pub atomic_publish: Option<bool>,
     pub io_uring_enabled: Option<bool>,
+    pub max_in_mem_partial_bytes: Option<usize>,
 }
 
 impl EdgeMemoryStorageBuilder {
@@ -101,6 +106,10 @@ impl EdgeMemoryStorageBuilder {
         self.io_uring_enabled = v;
         self
     }
+    pub fn with_max_in_mem_partial_bytes(mut self, v: Option<usize>) -> Self {
+        self.max_in_mem_partial_bytes = v;
+        self
+    }
 
     /// Build an `EdgeMemoryStorage` instance from this builder.
     ///
@@ -115,6 +124,7 @@ impl EdgeMemoryStorageBuilder {
         // Apply toggles where implemented
         s.atomic_publish = self.atomic_publish.unwrap_or(false);
         s.io_uring_enabled = self.io_uring_enabled.unwrap_or(false);
+        s.max_in_mem_partial_bytes = self.max_in_mem_partial_bytes;
         s
     }
 }

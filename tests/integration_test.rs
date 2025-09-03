@@ -314,4 +314,86 @@ mod persistence_and_streaming {
         assert_eq!(buf2, b"world");
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn streaming_to_disk_bounded_memory_tokio() -> Result<()> {
+        // Verify stream-to-disk during writes with bounded in-memory tail still serves full content
+        use std::fs as stdfs;
+        let root = temp_root("stream_bound");
+        // Ensure root exists
+        stdfs::create_dir_all(&root).ok();
+        let storage: &'static EdgeMemoryStorage = Box::leak(Box::new(
+            EdgeMemoryStorageBuilder::new()
+                .with_disk_root(root.clone())
+                .with_atomic_publish(Some(true))
+                .with_max_in_mem_partial_bytes(Some(5))
+                .build(),
+        ));
+        let key = CacheKey::new("ns", "/partial_bounded", "u1");
+        let meta = make_meta(60);
+
+        let trace = Span::inactive().handle();
+        let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
+
+        // Attach reader before writes to avoid timing races; still writes go to disk
+        let tag = mh.streaming_write_tag().unwrap().to_vec();
+        let storage_c = storage;
+        let key_c = key.clone();
+        let reader: tokio::task::JoinHandle<Result<Vec<u8>>> = tokio::spawn(async move {
+            let trace = Span::inactive().handle();
+            let (_m2, mut hit) = storage_c
+                .lookup_streaming_write(&key_c, Some(&tag[..]), &trace)
+                .await?
+                .expect("partial hit");
+            let mut read = Vec::new();
+            while let Some(chunk) = hit.read_body().await? {
+                read.extend_from_slice(chunk.as_ref());
+            }
+            Result::Ok(read)
+        });
+
+        // First chunk exceeds the 5-byte in-memory cap, forcing a trim
+        mh.write_body(Bytes::from_static(b"hello "), false).await?; // 6 bytes
+        // Complete the write
+        mh.write_body(Bytes::from_static(b"world"), true).await?;
+        mh.finish().await?;
+
+        let collected = reader.await.unwrap()?;
+        assert_eq!(collected, b"hello world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_write_failure_cleans_partial_tokio() {
+        use std::fs as stdfs;
+        // Create a file and use it as disk_root to cause ENOTDIR during writes
+        let mut bad_root = temp_root("badroot_file");
+        stdfs::create_dir_all(bad_root.parent().unwrap()).ok();
+        // Create the file at bad_root
+        stdfs::write(&bad_root, b"x").unwrap();
+
+        let storage: &'static EdgeMemoryStorage = Box::leak(Box::new(
+            EdgeMemoryStorageBuilder::new()
+                .with_disk_root(bad_root.clone())
+                .with_max_in_mem_partial_bytes(Some(4))
+                .build(),
+        ));
+        let trace = Span::inactive().handle();
+        let key = CacheKey::new("ns", "/fail_write", "u1");
+        let meta = make_meta(60);
+
+        let mut mh = storage.get_miss_handler(&key, &meta, &trace).await.unwrap();
+        // This write should fail because parent path components are not directories
+        let err = mh
+            .write_body(Bytes::from_static(b"data"), true)
+            .await
+            .expect_err("expected streaming write failure");
+        let s = format!("{err}");
+        assert!(s.contains("write"), "error should be a write error: {s}");
+
+        // After failure, a new miss handler should be admitted (no leaked partial)
+        let mh2 = storage.get_miss_handler(&key, &meta, &trace).await;
+        assert!(mh2.is_ok(), "new writer admitted after failure");
+    }
 }

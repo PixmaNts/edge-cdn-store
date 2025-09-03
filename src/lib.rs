@@ -136,6 +136,9 @@ pub struct EdgeMemoryStorage {
     /// io_uring configuration: enabled flag + lazy-initialized manager sender
     io_uring_enabled: bool,
     io_uring_tx: Mutex<Option<mpsc::Sender<IoUringRequest>>>,
+
+    /// Max bytes to keep in-memory for partial writes (per object)
+    pub max_in_mem_partial_bytes: Option<usize>,
 }
 
 /// A complete cached object ready for immediate serving
@@ -156,6 +159,10 @@ struct PartialObject {
     notify: Arc<watch::Sender<usize>>,
     /// Streaming write identifier as bytes for matching
     write_id_bytes: [u8; 8],
+    /// Path to the on-disk body being streamed to
+    disk_body_path: PathBuf,
+    /// Base offset of in-memory buffer relative to file start
+    base_offset: Arc<AtomicUsize>,
 }
 
 impl EdgeMemoryStorage {
@@ -186,6 +193,7 @@ impl EdgeMemoryStorage {
             atomic_publish: false,
             io_uring_enabled: false,
             io_uring_tx: Mutex::new(None),
+            max_in_mem_partial_bytes: None,
         }
     }
 
@@ -385,14 +393,23 @@ pub struct PartialHitHandler {
     body: Arc<RwLock<Vec<u8>>>,
     notify: watch::Receiver<usize>,
     position: usize,
+    disk_body_path: PathBuf,
+    base_offset: Arc<AtomicUsize>,
 }
 
 impl PartialHitHandler {
-    fn new(body: Arc<RwLock<Vec<u8>>>, notify: watch::Receiver<usize>) -> Self {
+    fn new(
+        body: Arc<RwLock<Vec<u8>>>,
+        notify: watch::Receiver<usize>,
+        disk_body_path: PathBuf,
+        base_offset: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             body,
             notify,
             position: 0,
+            disk_body_path,
+            base_offset,
         }
     }
 
@@ -413,12 +430,32 @@ impl PartialHitHandler {
 
             if available_bytes > self.position {
                 // New data is available
-                let body = self.body.read().await;
-                let end = available_bytes.min(body.len());
-                if self.position < end {
-                    let chunk = Bytes::copy_from_slice(&body[self.position..end]);
-                    self.position = end;
-                    return Some(chunk);
+                // If requested position is behind the in-memory base, read from disk first
+                let base = self.base_offset.load(Ordering::Relaxed);
+                if self.position < base {
+                    let to = base.min(self.position + 64 * 1024);
+                    if let Ok(mut f) = fs::File::open(&self.disk_body_path).await {
+                        use tokio::io::AsyncSeekExt;
+                        let _ = f.seek(std::io::SeekFrom::Start(self.position as u64)).await;
+                        let mut buf = vec![0u8; to - self.position];
+                        if let Ok(n) = f.read(&mut buf).await {
+                            if n > 0 {
+                                buf.truncate(n);
+                                self.position += n;
+                                return Some(Bytes::from(buf));
+                            }
+                        }
+                    }
+                } else {
+                    let body = self.body.read().await;
+                    // Translate logical position to in-memory index
+                    let start = self.position - base;
+                    let end = ((available_bytes - base).min(body.len())).max(start);
+                    if start < end {
+                        let chunk = Bytes::copy_from_slice(&body[start..end]);
+                        self.position += end - start;
+                        return Some(chunk);
+                    }
                 }
             }
 
@@ -500,13 +537,79 @@ pub struct EdgeMissHandler {
     atomic_publish: bool,
     /// Optional io_uring sender for disk I/O
     io_uring_tx: Option<mpsc::Sender<IoUringRequest>>,
+    /// Path to the streaming body file (tmp when atomic)
+    disk_body_path: PathBuf,
+    /// Open file for tokio writes (non-uring)
+    out_file: Option<fs::File>,
+    /// Total bytes written to disk
+    write_offset: usize,
+    /// Base offset of in-memory buffer for partial readers
+    base_offset: Arc<AtomicUsize>,
+    /// In-memory partial capacity
+    max_in_mem_partial_bytes: Option<usize>,
 }
 
 #[async_trait]
 impl HandleMiss for EdgeMissHandler {
     async fn write_body(&mut self, data: Bytes, eof: bool) -> Result<()> {
+        // First, append to on-disk file to prevent OOM
+        if let Some(tx) = &self.io_uring_tx {
+            // io_uring write at current offset
+            let offset = self.write_offset as u64;
+            // Ensure parent directory exists before first uring write
+            if let Some(parent) = self.disk_body_path.parent() {
+                let _ = fs::create_dir_all(parent).await;
+            }
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = IoUringRequest::Write {
+                path: self.disk_body_path.clone(),
+                offset,
+                data: data.to_vec(),
+                resp: resp_tx,
+            };
+            if tx.send(req).await.is_err() {
+                self.cleanup_once();
+                return Error::e_explain(
+                    ErrorType::FileWriteError,
+                    "io_uring write send failed",
+                );
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(5), resp_rx).await {
+                Ok(Ok(Ok(n))) if n == data.len() => {
+                    self.write_offset += n;
+                }
+                _ => {
+                    self.cleanup_once();
+                    return Error::e_explain(ErrorType::FileWriteError, "io_uring write failed");
+                }
+            }
+        } else {
+            // tokio file write
+            if self.out_file.is_none() {
+                // Ensure dir exists
+                if let Some(parent) = self.disk_body_path.parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                let f = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&self.disk_body_path)
+                    .await
+                    .or_err(ErrorType::FileCreateError, "open body for write")?;
+                self.out_file = Some(f);
+            }
+            if let Some(f) = &mut self.out_file {
+                f.write_all(&data)
+                    .await
+                    .or_err(ErrorType::FileWriteError, "append body")?;
+                self.write_offset += data.len();
+            }
+        }
+
+        // Then, update in-memory buffer within limits for partial readers
         let mut body = self.body.write().await;
-        // Enforce max_object_bytes if configured
+        // Enforce max_object_bytes if configured (on logical size)
         if let Some(limit) = self.max_object_bytes {
             if body.len().saturating_add(data.len()) > limit {
                 return Error::e_explain(
@@ -516,15 +619,23 @@ impl HandleMiss for EdgeMissHandler {
             }
         }
         body.extend_from_slice(&data);
-        let new_len = body.len();
+        // Trim from the front if exceeding in-memory partial limit
+        if let Some(mem_cap) = self.max_in_mem_partial_bytes {
+            if body.len() > mem_cap {
+                let drop_bytes = body.len() - mem_cap;
+                let tail = body.split_off(drop_bytes);
+                *body = tail;
+                let prev = self.base_offset.fetch_add(drop_bytes, Ordering::Relaxed);
+                let _ = prev; // unused
+            }
+        }
+        let new_logical_len = self.base_offset.load(Ordering::Relaxed) + body.len();
         drop(body); // Release lock before sending notification
 
         if eof {
-            // Signal EOF with special marker
             let _ = self.notify.send(usize::MAX);
         } else {
-            // Notify readers of new available bytes
-            let _ = self.notify.send(new_len);
+            let _ = self.notify.send(new_logical_len);
         }
 
         Ok(())
@@ -1137,7 +1248,12 @@ impl Storage for EdgeMemoryStorage {
             if let Some(entry) = partials.iter().next() {
                 let po = entry.value();
                 let rx = po.notify.subscribe();
-                let handler: HitHandler = Box::new(PartialHitHandler::new(po.body.clone(), rx));
+                let handler: HitHandler = Box::new(PartialHitHandler::new(
+                    po.body.clone(),
+                    rx,
+                    po.disk_body_path.clone(),
+                    po.base_offset.clone(),
+                ));
                 let (internal, header) = (&po.meta.0, &po.meta.1);
                 let meta = CacheMeta::deserialize(internal, header)?;
                 MET_HITS.inc();
@@ -1186,7 +1302,12 @@ impl Storage for EdgeMemoryStorage {
                 {
                     let po = entry.value();
                     let rx = po.notify.subscribe();
-                    let handler: HitHandler = Box::new(PartialHitHandler::new(po.body.clone(), rx));
+                    let handler: HitHandler = Box::new(PartialHitHandler::new(
+                        po.body.clone(),
+                        rx,
+                        po.disk_body_path.clone(),
+                        po.base_offset.clone(),
+                    ));
                     let (internal, header) = (&po.meta.0, &po.meta.1);
                     let meta = CacheMeta::deserialize(internal, header)?;
                     MET_HITS.inc();
@@ -1228,22 +1349,27 @@ impl Storage for EdgeMemoryStorage {
         let write_id_bytes = write_id.to_be_bytes();
         let (tx, _rx) = watch::channel::<usize>(0);
         let (internal, header) = meta.serialize()?;
+        let hash = Self::hash_str(&key_s);
+        let dir = self.key_dir(&hash);
+        let working_dir = if self.atomic_publish { dir.with_extension("tmp") } else { dir.clone() };
+        let body_path = Self::body_path(&working_dir);
+
         let po = PartialObject {
             meta: (internal, header),
             body: Arc::new(RwLock::new(Vec::new())),
             notify: Arc::new(tx),
             write_id_bytes,
+            disk_body_path: body_path.clone(),
+            base_offset: Arc::new(AtomicUsize::new(0)),
         };
         let notify = po.notify.clone();
         let body = po.body.clone();
+        let base_offset_arc = po.base_offset.clone();
         self.partial
             .entry(key_s.clone())
             .or_default()
             .insert(write_id, po);
         GAUGE_PARTIALS.inc();
-
-        let hash = Self::hash_str(&key_s);
-        let dir = self.key_dir(&hash);
 
         let mh = EdgeMissHandler {
             key: key_s,
@@ -1262,6 +1388,11 @@ impl Storage for EdgeMemoryStorage {
             cleaned: false,
             atomic_publish: self.atomic_publish,
             io_uring_tx: self.try_get_uring_tx().await,
+            disk_body_path: body_path,
+            out_file: None,
+            write_offset: 0,
+            base_offset: base_offset_arc,
+            max_in_mem_partial_bytes: self.max_in_mem_partial_bytes,
         };
         Ok(Box::new(mh))
     }
