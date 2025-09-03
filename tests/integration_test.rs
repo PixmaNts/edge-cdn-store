@@ -42,7 +42,7 @@ mod basics {
 
 mod persistence_and_streaming {
     use bytes::Bytes;
-    use edge_cdn_store::EdgeMemoryStorage;
+    use edge_cdn_store::{EdgeMemoryStorage, EdgeMemoryStorageBuilder};
     use pingora::cache::storage::{PurgeType, Storage};
     use pingora::cache::trace::Span;
     use pingora::cache::{CacheKey, CacheMeta};

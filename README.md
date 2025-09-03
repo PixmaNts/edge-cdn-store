@@ -46,7 +46,7 @@ edge-cdn-cache-disk-root: "/var/lib/edge_store"
 edge-cdn-cache-max-disk-bytes: 1073741824       # optional; enforced on finish (approximate)
 edge-cdn-cache-max-object-bytes: 104857600      # optional; enforced during write/finish
 edge-cdn-cache-max-partial-writes: 64           # optional; enforced on admission
-edge-cdn-cache-atomic-publish: true             # planned
+edge-cdn-cache-atomic-publish: true             # enabled (atomic publish)
 edge-cdn-cache-io-uring-enabled: false          # planned
 ```
 
@@ -109,7 +109,7 @@ Included tests:
 
 ## Roadmap
 
-- Atomic publish (write `*.part`, fsync file + dir, rename) and optional `io_uring` backend.
-- Improve capacity accounting accuracy and add disk read/write metrics.
-- Tiered cache adapter to add a shared/distributed layer.
+- Optional `io_uring` backend for disk I/O.
+- Improve capacity accounting accuracy; expand disk metrics & tracing.
+- Hot-cache layer for small objects alongside disk.
 - Startup indexer to seed eviction manager and rebuild in-memory state.

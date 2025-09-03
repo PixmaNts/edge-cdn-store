@@ -38,6 +38,7 @@ use pingora::cache::trace::SpanHandle;
 use pingora::cache::{CacheKey, CacheMeta};
 use pingora::{ErrorType, OrErr};
 use prometheus::{IntCounter, IntGauge, register_int_counter, register_int_gauge};
+use prometheus::{Histogram, register_histogram};
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,6 +84,27 @@ static MET_STREAM_ATTACH_MISS: Lazy<IntCounter> = Lazy::new(|| {
     )
     .unwrap()
 });
+static MET_DEMOTED_TO_DISK: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "edge_cache_demotions_total",
+        "Number of entries demoted from memory to disk"
+    )
+    .unwrap()
+});
+static HIST_DISK_WRITE_SECS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "edge_cache_disk_write_seconds",
+        "Latency of disk persists in seconds"
+    )
+    .unwrap()
+});
+static HIST_DISK_READ_SECS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "edge_cache_disk_read_seconds",
+        "Latency of disk read ops in seconds"
+    )
+    .unwrap()
+});
 
 /// DashMap-based in-memory storage for pingora cache
 pub struct EdgeMemoryStorage {
@@ -105,6 +127,8 @@ pub struct EdgeMemoryStorage {
     // Accounting
     pub partial_count: AtomicUsize,
     pub disk_bytes_used: AtomicUsize,
+    /// Use atomic publish for on-disk persistence
+    pub atomic_publish: bool,
 }
 
 /// A complete cached object ready for immediate serving
@@ -152,6 +176,7 @@ impl EdgeMemoryStorage {
             max_disk_bytes: None,
             partial_count: AtomicUsize::new(0),
             disk_bytes_used: AtomicUsize::new(0),
+            atomic_publish: false,
         }
     }
 
@@ -423,6 +448,8 @@ pub struct EdgeMissHandler {
     disk_bytes_used: &'static AtomicUsize,
     /// Internal: ensure cleanup (map removal + counters) happens exactly once
     cleaned: bool,
+    /// Whether to use atomic publish for disk persistence
+    atomic_publish: bool,
 }
 
 #[async_trait]
@@ -531,10 +558,19 @@ impl HandleMiss for EdgeMissHandler {
         let (internal, header) = self.meta.clone();
         let key_to_remove = self.key.clone();
         let cache_for_remove = Arc::clone(&self.cache);
+        let use_atomic = self.atomic_publish;
         tokio::spawn(async move {
-            if persist_to_disk(dir, &internal, &header, &body_arc).await.is_ok() {
+            let start = std::time::Instant::now();
+            let res = if use_atomic {
+                persist_to_disk_atomic(dir, &internal, &header, &body_arc).await
+            } else {
+                persist_to_disk(dir, &internal, &header, &body_arc).await
+            };
+            if res.is_ok() {
+                HIST_DISK_WRITE_SECS.observe(start.elapsed().as_secs_f64());
                 if cache_for_remove.remove(&key_to_remove).is_some() {
                     GAUGE_KEYS.dec();
+                    MET_DEMOTED_TO_DISK.inc();
                 }
             }
         });
@@ -624,6 +660,80 @@ async fn persist_to_disk(
     Ok(())
 }
 
+// Atomic publish variant: write to a temp directory and atomically rename
+async fn persist_to_disk_atomic(
+    dir: PathBuf,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+    body: &Arc<Vec<u8>>,
+) -> Result<()> {
+    // temp path sibling (e.g., <dir>.tmp)
+    let tmp = dir.with_extension("tmp");
+    // Ensure parent exists
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .or_err(ErrorType::FileCreateError, "create parent dir")?;
+    }
+    // Clean previous tmp if present
+    let _ = fs::remove_dir_all(&tmp).await;
+    fs::create_dir_all(&tmp)
+        .await
+        .or_err(ErrorType::FileCreateError, "create tmp cache dir")?;
+    // Write files into tmp dir and fsync them
+    let mut f = fs::File::create(EdgeMemoryStorage::body_path(&tmp))
+        .await
+        .or_err(ErrorType::FileCreateError, "create tmp body file")?;
+    f.write_all(body)
+        .await
+        .or_err(ErrorType::FileWriteError, "write tmp body file")?;
+    f.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync tmp body file")?;
+    drop(f);
+
+    let mut mi = fs::File::create(EdgeMemoryStorage::meta_internal_path(&tmp))
+        .await
+        .or_err(ErrorType::FileCreateError, "create tmp internal meta file")?;
+    mi.write_all(meta_internal)
+        .await
+        .or_err(ErrorType::FileWriteError, "write tmp internal meta file")?;
+    mi.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync tmp internal meta file")?;
+    drop(mi);
+
+    let mut mh = fs::File::create(EdgeMemoryStorage::meta_header_path(&tmp))
+        .await
+        .or_err(ErrorType::FileCreateError, "create tmp header meta file")?;
+    mh.write_all(meta_header)
+        .await
+        .or_err(ErrorType::FileWriteError, "write tmp header meta file")?;
+    mh.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync tmp header meta file")?;
+    drop(mh);
+
+    // Best-effort fsync of tmp dir parent using blocking std API
+    if let Some(parent) = tmp.parent() {
+        let parent = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(dir_file) = std::fs::File::open(&parent) {
+                let _ = dir_file.sync_all();
+            }
+        })
+        .await;
+    }
+
+    // Rename tmp -> final atomically
+    // Remove existing final dir if present (best-effort)
+    let _ = fs::remove_dir_all(&dir).await;
+    fs::rename(&tmp, &dir)
+        .await
+        .or_err(ErrorType::FileWriteError, "rename tmp->final")?;
+    Ok(())
+}
+
 // Check disk paths exist and load meta; open body file for disk-backed handler
 async fn open_disk_hit(dir: &Path) -> Result<Option<((Vec<u8>, Vec<u8>), fs::File)>> {
     let body_path = EdgeMemoryStorage::body_path(dir);
@@ -665,6 +775,23 @@ async fn open_disk_hit(dir: &Path) -> Result<Option<((Vec<u8>, Vec<u8>), fs::Fil
     }
 }
 
+async fn open_disk_hit_with_retry(dir: &Path) -> Result<Option<((Vec<u8>, Vec<u8>), fs::File)>> {
+    let mut attempt = 0;
+    loop {
+        match open_disk_hit(dir).await {
+            Ok(res) => return Ok(res),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 3 {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10 * attempt)).await;
+                continue;
+            }
+        }
+    }
+}
+
 /// Hit handler that reads directly from disk in chunks (not used in MVP hot path)
 struct DiskHitHandler {
     file: fs::File,
@@ -676,6 +803,7 @@ struct DiskHitHandler {
 impl HandleHit for DiskHitHandler {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
         // Respect range end if set and seek to current position
+        let start = std::time::Instant::now();
         let to_read = match self.end {
             Some(end) if end <= self.position => 0,
             Some(end) => (end - self.position).min(64 * 1024) as usize,
@@ -696,6 +824,7 @@ impl HandleHit for DiskHitHandler {
             .read(&mut buf)
             .await
             .or_err(ErrorType::FileReadError, "disk hit read")?;
+        HIST_DISK_READ_SECS.observe(start.elapsed().as_secs_f64());
         if n == 0 {
             return Ok(None);
         }
@@ -762,7 +891,7 @@ impl Storage for EdgeMemoryStorage {
         // Disk-backed hit without loading whole body into memory
         let hash = Self::hash_str(&key_s);
         let dir = self.key_dir(&hash);
-        if let Some(((mi, mh), file)) = open_disk_hit(&dir).await? {
+        if let Some(((mi, mh), file)) = open_disk_hit_with_retry(&dir).await? {
             let meta = CacheMeta::deserialize(&mi, &mh)?;
             let handler: HitHandler = Box::new(DiskHitHandler {
                 file,
@@ -866,6 +995,7 @@ impl Storage for EdgeMemoryStorage {
             max_disk_bytes: self.max_disk_bytes,
             disk_bytes_used: &self.disk_bytes_used,
             cleaned: false,
+            atomic_publish: self.atomic_publish,
         };
         Ok(Box::new(mh))
     }
@@ -1039,6 +1169,113 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        Ok(())
+    }
+
+    fn get_counter_value(name: &str) -> f64 {
+        for mf in prometheus::gather() {
+            if mf.get_name() == name {
+                let mut sum = 0.0;
+                for m in mf.get_metric() {
+                    if m.has_counter() {
+                        sum += m.get_counter().get_value();
+                    }
+                }
+                return sum;
+            }
+        }
+        0.0
+    }
+
+    #[tokio::test]
+    async fn demotion_increments_metric() -> Result<()> {
+        use bytes::Bytes;
+        let root = temp_root("demote_metric");
+        let storage: &'static EdgeMemoryStorage =
+            Box::leak(Box::new(EdgeMemoryStorage::with_disk_root(root.clone())));
+        let trace = Span::inactive().handle();
+        let key = CacheKey::new("ns", "/dmetric", "u1");
+        let meta = make_meta(60);
+
+        let before = get_counter_value("edge_cache_demotions_total");
+
+        let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
+        mh.write_body(Bytes::from_static(b"abc"), true).await?;
+        mh.finish().await?;
+
+        // Wait until demotion happens (in-memory removed)
+        let key_s = storage.key_to_hash(&key);
+        let mut tries = 0;
+        loop {
+            if !storage.cache.contains_key(&key_s) {
+                break;
+            }
+            tries += 1;
+            if tries > 200 {
+                panic!("demotion did not complete");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let after = get_counter_value("edge_cache_demotions_total");
+        assert!(after >= before + 1.0, "demotion counter should increase");
+        Ok(())
+    }
+
+     #[tokio::test]
+    async fn atomic_publish_persists_and_no_tmp_left() -> Result<()> {
+        use tokio::fs as tfs;
+        let root = temp_root("atomic");
+        let storage: &'static EdgeMemoryStorage = Box::leak(Box::new(
+            EdgeMemoryStorageBuilder::new()
+                .with_disk_root(root.clone())
+                .with_atomic_publish(Some(true))
+                .build(),
+        ));
+        let trace = Span::inactive().handle();
+        let key = CacheKey::new("ns", "/atomic", "u1");
+        let meta = make_meta(60);
+
+        // Write and finish
+        let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
+        mh.write_body(Bytes::from_static(b"hello atomic"), true).await?;
+        mh.finish().await?;
+
+        // Wait until final files are visible on disk and ensure tmp dir is gone
+        let hash = EdgeMemoryStorage::hash_str(&storage.key_to_hash(&key));
+        let dir = storage.key_dir(&hash);
+        let tmp_dir = dir.with_extension("tmp");
+
+        let mut tries = 0;
+        loop {
+            let body_ok = tfs::try_exists(EdgeMemoryStorage::body_path(&dir))
+                .await
+                .unwrap_or(false);
+            let mh_ok = tfs::try_exists(EdgeMemoryStorage::meta_header_path(&dir))
+                .await
+                .unwrap_or(false);
+            let mi_ok = tfs::try_exists(EdgeMemoryStorage::meta_internal_path(&dir))
+                .await
+                .unwrap_or(false);
+            if body_ok && mh_ok && mi_ok {
+                break;
+            }
+            tries += 1;
+            if tries > 100 {
+                panic!("atomic publish did not materialize final files");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // tmp dir should not exist once rename completed
+        let tmp_exists = tfs::try_exists(&tmp_dir).await.unwrap_or(false);
+        assert!(!tmp_exists, "temporary dir should be removed after atomic rename");
+
+        // New instance should be able to hit from disk
+        let storage2: &'static EdgeMemoryStorage =
+            Box::leak(Box::new(EdgeMemoryStorage::with_disk_root(root)));
+        let hit = storage2.lookup(&key, &trace).await?;
+        assert!(hit.is_some());
         Ok(())
     }
 }

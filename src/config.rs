@@ -112,7 +112,8 @@ impl EdgeMemoryStorageBuilder {
         s.max_object_bytes = self.max_object_bytes;
         s.max_partial_writes = self.max_partial_writes;
         s.max_disk_bytes = self.max_disk_bytes;
-        // Future: atomic_publish / io_uring_enabled toggles will be applied when implemented.
+        // Apply toggles where implemented
+        s.atomic_publish = self.atomic_publish.unwrap_or(false);
         s
     }
 }
