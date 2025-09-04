@@ -169,9 +169,6 @@ EDGE_IO_URING=1 EDGE_ATOMIC_PUBLISH=1 EDGE_STORE_DIR=/tmp/edge_store \
 # Minimal (YAML only)
 cargo run --example cdn_server -- -c examples/pingora.yaml
 ```
-- Improve capacity accounting accuracy; expand disk metrics & tracing.
-- Hot-cache layer for small objects alongside disk.
-- Startup indexer to seed eviction manager and rebuild in-memory state.
 
 ## License
 
@@ -188,4 +185,3 @@ at your option.
 - Changelog: `CHANGELOG.md`
 - Design: `design/requirement.md`, `design/proposal.md`, `design/architecture_diagrams.md`
 - Next steps / roadmap details: `design/next.md`
-```
