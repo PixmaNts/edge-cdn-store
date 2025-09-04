@@ -12,10 +12,10 @@ edge-cdn-cache-disk-root: "/tmp/edge_store"
 # edge-cdn-cache-max-disk-bytes: 1073741824   # 1 GiB
 # edge-cdn-cache-max-object-bytes: 104857600  # 100 MiB per object
 # edge-cdn-cache-max-partial-writes: 64
+# edge-cdn-cache-max-in-mem-partial-bytes: 1048576 # bytes kept in memory per in-progress object
 
 # Write path durability (atomic publish)
 edge-cdn-cache-atomic-publish: true
 
-# Enable io_uring for disk reads (optional)
+# Enable io_uring for disk reads and streaming writes (experimental)
 edge-cdn-cache-io-uring-enabled: true
-

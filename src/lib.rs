@@ -73,6 +73,20 @@ static GAUGE_DISK_BYTES: Lazy<IntGauge> = Lazy::new(|| {
     )
     .unwrap()
 });
+static GAUGE_ATOMIC_PUBLISH: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "edge_cache_atomic_publish_enabled",
+        "1 if atomic publish is enabled; 0 otherwise"
+    )
+    .unwrap()
+});
+static GAUGE_IO_URING_ENABLED: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "edge_cache_io_uring_enabled",
+        "1 if io_uring path is enabled; 0 otherwise"
+    )
+    .unwrap()
+});
 static MET_STREAM_ATTACH_OK: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "edge_cache_stream_attach_total",
@@ -180,7 +194,7 @@ impl EdgeMemoryStorage {
 
     /// Create with explicit disk root directory
     pub fn with_disk_root(disk_root: PathBuf) -> Self {
-        Self {
+        let s = Self {
             cache: Arc::new(DashMap::new()),
             partial: Arc::new(DashMap::new()),
             write_counter: AtomicU64::new(0),
@@ -190,23 +204,33 @@ impl EdgeMemoryStorage {
             max_disk_bytes: None,
             partial_count: AtomicUsize::new(0),
             disk_bytes_used: AtomicUsize::new(0),
-            atomic_publish: false,
+            atomic_publish: true,
             io_uring_enabled: false,
             io_uring_tx: Mutex::new(None),
             max_in_mem_partial_bytes: None,
-        }
+        };
+        s.update_feature_gauges();
+        s
     }
 
     /// Create from an EdgeStoreConfig (parsed from YAML) via the builder.
     pub fn from_config(cfg: &EdgeStoreConfig) -> Self {
-        EdgeMemoryStorageBuilder::new()
+        let s = EdgeMemoryStorageBuilder::new()
             .with_disk_root(cfg.resolve_disk_root())
             .with_max_disk_bytes(cfg.max_disk_bytes)
             .with_max_object_bytes(cfg.max_object_bytes)
             .with_max_partial_writes(cfg.max_partial_writes)
             .with_atomic_publish(cfg.atomic_publish)
             .with_io_uring_enabled(cfg.io_uring_enabled)
-            .build()
+            .build();
+        s.update_feature_gauges();
+        s
+    }
+
+    /// Update feature toggle gauges to reflect current configuration
+    pub fn update_feature_gauges(&self) {
+        GAUGE_ATOMIC_PUBLISH.set(if self.atomic_publish { 1 } else { 0 });
+        GAUGE_IO_URING_ENABLED.set(if self.io_uring_enabled { 1 } else { 0 });
     }
 
     /// Lazily initialize and health‑probe an io_uring sender if enabled.
@@ -642,11 +666,16 @@ impl HandleMiss for EdgeMissHandler {
     }
 
     async fn finish(self: Box<Self>) -> Result<MissFinishType> {
-        // Move from partial to complete cache
-        let body = self.body.read().await;
-        let body_size = body.len();
-        let complete_body = body.clone();
-        drop(body); // Release read lock
+        // Finalize: assemble complete body from disk (authoritative), since in-memory may be trimmed
+        let mut full = Vec::with_capacity(self.write_offset);
+        let mut f = fs::File::open(&self.disk_body_path)
+            .await
+            .or_err(ErrorType::FileOpenError, "open streamed body for finalize")?;
+        f.read_to_end(&mut full)
+            .await
+            .or_err(ErrorType::FileReadError, "read streamed body for finalize")?;
+        let body_size = full.len();
+        let complete_body = full;
 
         // Enforce disk capacity if configured
         if let Some(limit) = self.max_object_bytes {
@@ -714,8 +743,13 @@ impl HandleMiss for EdgeMissHandler {
         self.cache.insert(self.key.clone(), cache_object);
         GAUGE_KEYS.set(self.cache.len() as i64);
 
-        // Persist to disk in background; after success, drop in-memory body to rely on disk
+        // Finalize on disk in background; write meta and optionally rename tmp -> final
         let dir = self.disk_dir.clone();
+        let working_dir = self
+            .disk_body_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dir.clone());
         let (internal, header) = self.meta.clone();
         let key_to_remove = self.key.clone();
         let cache_for_remove = Arc::clone(&self.cache);
@@ -723,15 +757,16 @@ impl HandleMiss for EdgeMissHandler {
         let uring_tx = self.io_uring_tx.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let res = match (use_atomic, uring_tx) {
-                (true, Some(tx)) => {
-                    persist_to_disk_atomic_uring(dir, &internal, &header, &body_arc, tx).await
+            let res = if use_atomic {
+                match uring_tx {
+                    Some(tx) => finalize_atomic_with_uring(dir, &working_dir, &internal, &header, tx).await,
+                    None => finalize_atomic_tokio(dir, &working_dir, &internal, &header).await,
                 }
-                (false, Some(tx)) => {
-                    persist_to_disk_uring(dir, &internal, &header, &body_arc, tx).await
+            } else {
+                match uring_tx {
+                    Some(tx) => finalize_non_atomic_with_uring(&working_dir, &internal, &header, tx).await,
+                    None => finalize_non_atomic_tokio(&working_dir, &internal, &header).await,
                 }
-                (true, None) => persist_to_disk_atomic(dir, &internal, &header, &body_arc).await,
-                (false, None) => persist_to_disk(dir, &internal, &header, &body_arc).await,
             };
             if res.is_ok() {
                 HIST_DISK_WRITE_SECS.observe(start.elapsed().as_secs_f64());
@@ -1023,6 +1058,126 @@ async fn persist_to_disk_atomic_uring(
     // Rename tmp -> final
     let _ = fs::remove_dir_all(&dir).await;
     fs::rename(&tmp, &dir)
+        .await
+        .or_err(ErrorType::FileWriteError, "rename tmp->final")?;
+    Ok(())
+}
+
+// Finalize helpers: write meta only
+async fn finalize_non_atomic_tokio(
+    working_dir: &Path,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+) -> Result<()> {
+    let _ = fs::create_dir_all(working_dir).await;
+    let mut mi = fs::File::create(EdgeMemoryStorage::meta_internal_path(working_dir))
+        .await
+        .or_err(ErrorType::FileCreateError, "create internal meta file")?;
+    mi.write_all(meta_internal)
+        .await
+        .or_err(ErrorType::FileWriteError, "write internal meta file")?;
+    mi.flush()
+        .await
+        .or_err(ErrorType::FileWriteError, "flush internal meta file")?;
+    drop(mi);
+    let mut mh = fs::File::create(EdgeMemoryStorage::meta_header_path(working_dir))
+        .await
+        .or_err(ErrorType::FileCreateError, "create header meta file")?;
+    mh.write_all(meta_header)
+        .await
+        .or_err(ErrorType::FileWriteError, "write header meta file")?;
+    mh.flush()
+        .await
+        .or_err(ErrorType::FileWriteError, "flush header meta file")?;
+    drop(mh);
+    Ok(())
+}
+
+async fn finalize_non_atomic_with_uring(
+    working_dir: &Path,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+    tx: mpsc::Sender<IoUringRequest>,
+) -> Result<()> {
+    let _ = fs::create_dir_all(working_dir).await;
+    write_all_with_uring(&EdgeMemoryStorage::meta_internal_path(working_dir), meta_internal, &tx).await?;
+    write_all_with_uring(&EdgeMemoryStorage::meta_header_path(working_dir), meta_header, &tx).await?;
+    Ok(())
+}
+
+async fn finalize_atomic_tokio(
+    final_dir: PathBuf,
+    working_dir: &Path,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+) -> Result<()> {
+    finalize_non_atomic_tokio(working_dir, meta_internal, meta_header).await?;
+    // fsync files
+    let mut mi = fs::File::open(EdgeMemoryStorage::meta_internal_path(working_dir))
+        .await
+        .or_err(ErrorType::FileOpenError, "open internal meta file")?;
+    mi.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync internal meta file")?;
+    drop(mi);
+    let mut mh = fs::File::open(EdgeMemoryStorage::meta_header_path(working_dir))
+        .await
+        .or_err(ErrorType::FileOpenError, "open header meta file")?;
+    mh.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync header meta file")?;
+    drop(mh);
+    // fsync parent dir and rename
+    if let Some(parent) = working_dir.parent() {
+        let parent = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(dir_file) = std::fs::File::open(&parent) {
+                let _ = dir_file.sync_all();
+            }
+        })
+        .await;
+    }
+    let _ = fs::remove_dir_all(&final_dir).await;
+    fs::rename(working_dir, &final_dir)
+        .await
+        .or_err(ErrorType::FileWriteError, "rename tmp->final")?;
+    Ok(())
+}
+
+async fn finalize_atomic_with_uring(
+    final_dir: PathBuf,
+    working_dir: &Path,
+    meta_internal: &[u8],
+    meta_header: &[u8],
+    tx: mpsc::Sender<IoUringRequest>,
+) -> Result<()> {
+    finalize_non_atomic_with_uring(working_dir, meta_internal, meta_header, tx).await?;
+    // fsync files via tokio (no uring fsync helper here)
+    let mut mi = fs::File::open(EdgeMemoryStorage::meta_internal_path(working_dir))
+        .await
+        .or_err(ErrorType::FileOpenError, "open internal meta file")?;
+    mi.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync internal meta file")?;
+    drop(mi);
+    let mut mh = fs::File::open(EdgeMemoryStorage::meta_header_path(working_dir))
+        .await
+        .or_err(ErrorType::FileOpenError, "open header meta file")?;
+    mh.sync_all()
+        .await
+        .or_err(ErrorType::FileWriteError, "sync header meta file")?;
+    drop(mh);
+    if let Some(parent) = working_dir.parent() {
+        let parent = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(dir_file) = std::fs::File::open(&parent) {
+                let _ = dir_file.sync_all();
+            }
+        })
+        .await;
+    }
+    let _ = fs::remove_dir_all(&final_dir).await;
+    fs::rename(working_dir, &final_dir)
         .await
         .or_err(ErrorType::FileWriteError, "rename tmp->final")?;
     Ok(())

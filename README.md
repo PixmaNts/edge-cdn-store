@@ -6,6 +6,12 @@ A CDN cache storage backend implementation for the `pingora_cache` library, deve
 
 This project implements a storage layer for CDN caching that integrates with Cloudflare's `pingora_cache` framework. The implementation focuses on high-concurrency scenarios, low memory usage, and pluggable observability features.
 
+Status at a glance:
+- Implements `pingora_cache::Storage` with async Tokio I/O and streaming partial writes.
+- Persists to disk with atomic publish enabled by default (tmp + fsync + atomic rename). Non-atomic finalize is available but less durable.
+- Optional `io_uring` support for disk reads and streaming writes (experimental; finalize still fsyncs via Tokio). See notes below.
+- Prometheus metrics for hits/misses, eviction/invalidation, streaming attach, key/partial gauges, and disk I/O histograms.
+
 ## Features
 
 - High-performance concurrent metadata operations
@@ -26,6 +32,11 @@ This project implements a storage layer for CDN caching that integrates with Clo
 
 The implementation provides a custom storage backend for `pingora_cache` by implementing the `Storage` trait. See `design/` directory for detailed proposal and requirements.
 
+io_uring support (experimental):
+- When enabled, disk reads and streaming body writes use `io_uring` with graceful fallback to Tokio.
+- Finalize (fsync + rename) currently uses Tokio APIs; this is acceptable but not fully uring-native yet.
+- Integration tests for `io_uring` exist and are marked `#[ignore]` as they depend on host kernel/capabilities.
+
 ### Disk Layout (MVP)
 
 `<root>/<hh>/<hh>/<full_hash>/`
@@ -43,11 +54,12 @@ Add the following keys to your Pingora YAML (top-level):
 
 ```
 edge-cdn-cache-disk-root: "/var/lib/edge_store"
-edge-cdn-cache-max-disk-bytes: 1073741824       # optional; enforced on finish (approximate)
-edge-cdn-cache-max-object-bytes: 104857600      # optional; enforced during write/finish
+edge-cdn-cache-max-disk-bytes: 1073741824       # optional; enforced on finish (approximate, body-only)
+edge-cdn-cache-max-object-bytes: 104857600      # optional; enforced during write and on finish
 edge-cdn-cache-max-partial-writes: 64           # optional; enforced on admission
-edge-cdn-cache-atomic-publish: true             # enabled (atomic publish)
-edge-cdn-cache-io-uring-enabled: false          # optional (uses io_uring for disk reads)
+edge-cdn-cache-max-in-mem-partial-bytes: 1048576 # optional; per-object tail kept in memory for partial readers
+edge-cdn-cache-atomic-publish: true             # default: true; write meta + fsync + atomic rename
+edge-cdn-cache-io-uring-enabled: false          # optional; enable uring for reads + streaming writes (experimental)
 ```
 
 Programmatic usage:
@@ -92,6 +104,9 @@ Exported by the library (via global registries):
 - `edge_cache_stream_attach_miss_total`
 - `edge_cache_keys` (gauge)
 - `edge_cache_partial_writes` (gauge)
+- `edge_cache_disk_bytes` (gauge)
+- `edge_cache_atomic_publish_enabled` (gauge; 1 if enabled)
+- `edge_cache_io_uring_enabled` (gauge; 1 if enabled)
 
 The example exposes a Prometheus HTTP server; you can also scrape these from any app that links the library.
 
@@ -105,11 +120,18 @@ cargo test
 
 Included tests:
 - Integration tests (write→hit→reload→purge, streaming partials, seek).
-- Config parser tests (full/partial/unknown YAML).
+- Capacity tests (disk/object caps, partial writer limits, regression for counter underflow).
+- io_uring parity tests exist and are `#[ignore]` by default (environment-dependent).
 
-## Roadmap
+## Roadmap / TODO
 
-- Expand `io_uring` backend to writes and atomic publish.
+- Durability: Add fsync of meta and parent dir in non-atomic finalize path (or recommend atomic publish by default).
+- Eviction coordination: On `max_disk_bytes` exceed at finish, attempt purge via EvictionManager before rejecting finishes.
+- Startup indexer: Scan disk to seed eviction state and rebuild in-memory state; compute disk usage at boot.
+- io_uring hardening: Feature-gate; expand finalize ops to be uring-native; unignore tests when supported; add a gauge to indicate active uring mode.
+- Metrics: Expand disk/capacity metrics and tracing spans; include error counters for write/read failures and finalize outcomes.
+- Hot-cache layer: Optional small-object in-memory layer alongside disk for very hot items.
+- Documentation: Keep README and example YAML aligned; clearly tag experimental features (io_uring).
 
 ## Example Configuration
 
@@ -122,6 +144,7 @@ edge-cdn-cache-disk-root: "/var/lib/edge_store"
 edge-cdn-cache-max-disk-bytes: 1073741824
 edge-cdn-cache-max-object-bytes: 104857600
 edge-cdn-cache-max-partial-writes: 64
+edge-cdn-cache-max-in-mem-partial-bytes: 1048576
 edge-cdn-cache-atomic-publish: true
 edge-cdn-cache-io-uring-enabled: true
 ```
@@ -132,6 +155,7 @@ Env overrides (optional):
 - `EDGE_MAX_DISK_BYTES`: integer bytes
 - `EDGE_MAX_OBJECT_BYTES`: integer bytes
 - `EDGE_MAX_PARTIAL_WRITES`: integer
+- `EDGE_MAX_IN_MEM_PARTIAL_BYTES`: integer (per-object tail kept in memory)
 - `EDGE_ATOMIC_PUBLISH`: 0/1/true/false
 - `EDGE_IO_URING`: 0/1/true/false
 
@@ -148,3 +172,20 @@ cargo run --example cdn_server -- -c examples/pingora.yaml
 - Improve capacity accounting accuracy; expand disk metrics & tracing.
 - Hot-cache layer for small objects alongside disk.
 - Startup indexer to seed eviction manager and rebuild in-memory state.
+
+## License
+
+This project is licensed under either of
+
+- MIT license (see `LICENSE-MIT`), or
+- Apache License, Version 2.0 (see `LICENSE-APACHE`),
+
+at your option.
+
+## Links
+
+- GitHub repository: https://github.com/PixmaNts/edge-cdn-store
+- Changelog: `CHANGELOG.md`
+- Design: `design/requirement.md`, `design/proposal.md`, `design/architecture_diagrams.md`
+- Next steps / roadmap details: `design/next.md`
+```

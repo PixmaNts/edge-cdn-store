@@ -9,7 +9,7 @@ graph LR
     subgraph "Edge CDN Store"
         EdgeStorage["EdgeStorage"]
         DashMap["DashMap<br>(Metadata & In-Progress)"]
-        DiskStorage["DiskStorage (Tokio fs)"]
+        DiskStorage["DiskStorage (Tokio fs / io_uring*)"]
         EdgeStorage --> DashMap
         EdgeStorage --> DiskStorage
     end
@@ -124,4 +124,4 @@ sequenceDiagram
 ```
 
 Notes:
-- The current MVP uses `tokio::fs` for DiskStorage. An `io_uring` backend is planned and can replace the DiskStorage box with minimal changes to the architecture.
+- The MVP uses `tokio::fs` for DiskStorage; an optional, experimental `io_uring` path is available for disk reads and streaming writes. Finalize/fsync currently uses Tokio APIs.

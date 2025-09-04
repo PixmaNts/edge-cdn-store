@@ -11,23 +11,23 @@ pub struct EdgeStoreConfig {
     #[serde(rename = "edge-cdn-cache-disk-root")]
     pub disk_root: Option<String>,
 
-    /// Maximum total disk usage in bytes (optional, not enforced yet)
+    /// Maximum total disk usage in bytes (optional; enforced approximately on finish, body bytes only)
     #[serde(rename = "edge-cdn-cache-max-disk-bytes")]
     pub max_disk_bytes: Option<usize>,
 
-    /// Maximum single object size admitted in bytes (optional, not enforced yet)
+    /// Maximum single object size admitted in bytes (optional; enforced during writes and on finish)
     #[serde(rename = "edge-cdn-cache-max-object-bytes")]
     pub max_object_bytes: Option<usize>,
 
-    /// Maximum number of concurrent partial writes (optional, not enforced yet)
+    /// Maximum number of concurrent partial writes (optional; enforced on admission)
     #[serde(rename = "edge-cdn-cache-max-partial-writes")]
     pub max_partial_writes: Option<usize>,
 
-    /// Enable atomic publish (write .part + fsync + rename) (planned)
+    /// Enable atomic publish (write tmp + fsync + atomic rename). Recommended for stronger durability.
     #[serde(rename = "edge-cdn-cache-atomic-publish")]
     pub atomic_publish: Option<bool>,
 
-    /// Enable io_uring backend when available (planned)
+    /// Enable io_uring backend when available (experimental): used for reads and streaming writes with fallback.
     #[serde(rename = "edge-cdn-cache-io-uring-enabled")]
     pub io_uring_enabled: Option<bool>,
 
@@ -122,9 +122,10 @@ impl EdgeMemoryStorageBuilder {
         s.max_partial_writes = self.max_partial_writes;
         s.max_disk_bytes = self.max_disk_bytes;
         // Apply toggles where implemented
-        s.atomic_publish = self.atomic_publish.unwrap_or(false);
+        s.atomic_publish = self.atomic_publish.unwrap_or(true);
         s.io_uring_enabled = self.io_uring_enabled.unwrap_or(false);
         s.max_in_mem_partial_bytes = self.max_in_mem_partial_bytes;
+        s.update_feature_gauges();
         s
     }
 }

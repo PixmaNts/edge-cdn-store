@@ -4,7 +4,7 @@
 
 This proposal outlines the design and implementation of `edge-cdn-store`, a CDN cache storage backend that implements the `pingora_cache::Storage` trait. The project aims to provide a caching solution for edge computing scenarios where low latency, high throughput, and data persistence are important.
 
-The architecture uses an in-memory `DashMap` for managing metadata and in-progress writes, coupled with a persistent on-disk storage layer. The current MVP uses `tokio::fs` for disk I/O; `io_uring` remains a planned enhancement. The design relies on the operating system's kernel page cache to keep hot data fast without an explicit in-memory data cache.
+The architecture uses an in-memory `DashMap` for managing metadata and in-progress writes, coupled with a persistent on-disk storage layer. The current MVP uses `tokio::fs` for disk I/O with optional, experimental `io_uring` for disk reads and streaming body writes. Finalize/fsync still uses Tokio APIs. The design relies on the operating system's kernel page cache to keep hot data fast without an explicit in-memory data cache.
 
 ## Motivation
 
@@ -72,14 +72,14 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 **2. On-Disk Storage (Persistent Cache)**
 
 - **Purpose**: Provide persistence and scale beyond RAM.
-- **Technology (MVP)**: `tokio::fs` async I/O. `io_uring` planned as an opt-in backend.
+- **Technology (MVP)**: `tokio::fs` async I/O. Optional `io_uring` backend for disk reads and streaming body writes (experimental); finalize/fsync currently via Tokio.
 - **Structure**: Per-key directory layout with: `body.bin`, `meta_internal.bin`, `meta_header.bin`.
 - **Serialization**: `CacheMeta::serialize()`/`deserialize()` with correct (internal, header) ordering.
 
 ### Current Status (MVP)
 
 - Storage trait implemented: `lookup`, `lookup_streaming_write`, `get_miss_handler`, `update_meta`, `purge`, and `support_streaming_partial_write`.
-- Streaming writes: concurrent in-progress per key; readers can attach via a tag returned by the miss handler.
+- Streaming writes: concurrent in-progress per key; readers can attach via a tag returned by the miss handler. Streaming body can write to disk via `io_uring` when enabled.
 - Persistence: on finish, completed objects are persisted in the background; storage reloads from disk (and repopulates memory) on demand.
 - Example proxy: Pingora example wired to use the storage; adds `x-cache-status` and `x-total-time-ms` headers.
 - Tests: integration tests for miss→hit→disk reload and streaming partial read; fixed a DashMap guard removal deadlock and EOF slicing bug.
@@ -173,7 +173,7 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 **Resource Overhead:**
 
 - MVP uses `tokio::fs` and works on stable kernels.
-- `io_uring` read path is implemented behind a config flag; write path remains on `tokio::fs` for now.
+- `io_uring` read path and streaming body write path are implemented behind a flag; finalize (fsync/rename) uses Tokio. Env/kernel support determines availability.
 
 **Development Time:**
 
@@ -218,12 +218,12 @@ When a request misses, data is loaded from the origin. It is progressively buffe
 **Phased Implementation:**
 
 - Phase 1 (done): In-memory management + tokio::fs persistence, streaming partials, tests, Pingora example.
-- Phase 2 (in progress): `io_uring` disk I/O behind a feature/env flag — read path done; next: write path and atomic publish (`*.part` + fsync + rename).
-- Phase 3: Eviction manager integration, metrics/observability, performance validation.
+- Phase 2 (partially done): `io_uring` behind a flag — disk read and streaming write paths done; next: extend finalize ops and fsync to be uring-native, harden and feature-gate, enable tests in supported CI.
+- Phase 3: Eviction manager coordination on capacity, metrics/observability expansion, performance validation.
 
 ## Summary & Conclusion
 
-The `EdgeMemoryStorage` architecture, using in-memory `DashMap` for metadata and in-progress writes with on-disk persistence (tokio::fs in MVP, `io_uring` planned), provides a CDN caching solution. It balances:
+The `EdgeMemoryStorage` architecture, using in-memory `DashMap` for metadata and in-progress writes with on-disk persistence (Tokio in MVP, optional `io_uring` for reads/streaming writes), provides a CDN caching solution. It balances:
 
 1. **Speed**: Low latency for new data (in-progress) and hot data (kernel page cache).
 2. **Persistence & Scale**: Storage for large datasets on disk.
@@ -240,9 +240,10 @@ This design addresses requirements for an edge CDN cache.
 - Memory and disk usage remain within operational limits.
 - Code review approval focusing on correctness and architectural soundness; later, `io_uring` safety.
 
-**Next Steps:**
+**Gaps / Next Steps:**
 
-1. Introduce `io_uring` backend behind a feature/env flag; add atomic publish with fsync + rename.
-2. Add metrics (hits/misses, disk ops, write/read timings) and optional eviction manager.
-3. Expand tests (range/seek, concurrent writers/readers, crash recovery) and run basic benchmarks.
-4. Improve example (HTTPS/H2 upstream, warm-up, knobs for storage paths and flags).
+1. Durability: For non-atomic finalize, add fsync of meta files and parent directory (or recommend atomic publish by default).
+2. Capacity: When `max_disk_bytes` would be exceeded on finish, coordinate with EvictionManager to evict before rejecting.
+3. Startup indexing: Scan disk to seed eviction state and compute disk usage at boot.
+4. io_uring: Feature-gate/harden, extend finalize ops to uring, and unignore tests in CI environments that support it.
+5. Metrics: Add more disk/capacity/error metrics and lightweight tracing for finalize outcomes.

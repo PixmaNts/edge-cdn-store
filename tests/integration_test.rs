@@ -396,4 +396,69 @@ mod persistence_and_streaming {
         let mh2 = storage.get_miss_handler(&key, &meta, &trace).await;
         assert!(mh2.is_ok(), "new writer admitted after failure");
     }
+
+    #[tokio::test]
+    async fn streaming_writes_visible_on_disk_before_finish_tokio() -> Result<()> {
+        use std::fs as stdfs;
+        // Deterministic test: verify body.bin grows on disk before finish
+        let root = temp_root("stream_visible");
+        let storage: &'static EdgeMemoryStorage = Box::leak(Box::new(
+            EdgeMemoryStorageBuilder::new()
+                .with_disk_root(root.clone())
+                .with_atomic_publish(Some(true))
+                .with_max_in_mem_partial_bytes(Some(4))
+                .build(),
+        ));
+
+        let trace = Span::inactive().handle();
+        let key = CacheKey::new("ns", "/visible", "u1");
+        let meta = make_meta(60);
+        let mut mh = storage.get_miss_handler(&key, &meta, &trace).await?;
+
+        // First write
+        mh.write_body(Bytes::from_static(b"hello"), false).await?; // 5 bytes
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Find tmp/body.bin and check size
+        let mut tmp_body = None;
+        let mut stack = vec![root.clone()];
+        while let Some(p) = stack.pop() {
+            if let Ok(rd) = stdfs::read_dir(&p) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        if name == "body.bin" {
+                            tmp_body = Some(path);
+                        }
+                    }
+                }
+            }
+        }
+        let tmp_body = tmp_body.expect("tmp body not found");
+        let sz1 = stdfs::metadata(&tmp_body).unwrap().len();
+        assert!(sz1 >= 5, "expected at least 5 bytes, got {sz1}");
+
+        // Second write
+        mh.write_body(Bytes::from_static(b" world"), true).await?; // +6 = 11 total
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let sz2 = stdfs::metadata(&tmp_body).unwrap().len();
+        assert!(sz2 >= 11, "expected at least 11 bytes, got {sz2}");
+
+        // Finish and verify final lookup returns the full body
+        mh.finish().await?;
+        let (_m, mut hit) = {
+            let mut tries = 0;
+            loop {
+                if let Some(h) = storage.lookup(&key, &trace).await? { break h; }
+                tries += 1; if tries > 50 { panic!("final body not visible"); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let mut buf = Vec::new();
+        while let Some(chunk) = hit.read_body().await? { buf.extend_from_slice(&chunk); }
+        assert_eq!(buf, b"hello world");
+        Ok(())
+    }
 }
